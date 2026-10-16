@@ -1,4 +1,5 @@
-import { mkdirSync, readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { SureCoordinator } from "../../src/core/sure/coordinator.ts";
@@ -8,25 +9,24 @@ import {
 	renderSureFailureReport,
 } from "../../src/core/sure/failure-report.ts";
 import type { SureDisplayState, SureRunRecord } from "../../src/core/sure/types.ts";
-import { createHarness, type Harness } from "./harness.ts";
 
-const harnesses: Harness[] = [];
+const directories: string[] = [];
 const display: SureDisplayState = {
 	phase: { id: "build_env", label: "Build model environment", status: "blocked" },
 	checkpoint: { resumable: true },
 };
-async function setup() {
-	const harness = await createHarness();
-	harnesses.push(harness);
-	const runDir = join(harness.tempDir, ".sure/runs/report-test");
+function setup() {
+	const tempDir = mkdtempSync(join(tmpdir(), "sure-report-"));
+	directories.push(tempDir);
+	const runDir = join(tempDir, ".sure/runs/report-test");
 	mkdirSync(runDir, { recursive: true });
 	const run: SureRunRecord = {
 		runId: "report-test",
 		skillName: "demo",
 		command: "sure_onboard",
-		cwd: harness.tempDir,
+		cwd: tempDir,
 		runDir,
-		packageDir: harness.tempDir,
+		packageDir: tempDir,
 		status: "failed",
 		args: "model=demo device=cuda",
 		startedAt: "now",
@@ -45,15 +45,15 @@ async function setup() {
 		},
 		[],
 	);
-	return { harness, run, coordinator };
+	return { run, coordinator };
 }
 afterEach(() => {
-	for (const harness of harnesses.splice(0)) harness.cleanup();
+	for (const dir of directories.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
 describe("Sure final user report", () => {
-	it("retains the execution failure across a failed original-condition recheck and unavailable supervisor", async () => {
-		const { run, coordinator } = await setup();
+	it("retains the execution failure across a failed original-condition recheck and unavailable supervisor", () => {
+		const { run, coordinator } = setup();
 		run.errorSummary = undefined;
 		for (let index = 0; index < 3; index++) coordinator.recordAction("build_env", "read", { path: "env.json" });
 		const restored = new SureCoordinator(run, "build_env", []);
@@ -69,12 +69,13 @@ describe("Sure final user report", () => {
 		expect(report.facts).toContain("Original CUDA import failed.");
 		expect(report.attempted.join("\n")).toContain("Original condition still failed");
 		expect(report.diagnosisStatus).toBe("unavailable");
+		expect(report.stopReason).toContain("Supervisor provider unavailable");
 	});
 
 	it.each(["failed", "incomplete", "cancelled"] as const)(
 		"owns recovery actions for a non-resumable %s run",
-		async (status) => {
-			const { run, coordinator } = await setup();
+		(status) => {
+			const { run, coordinator } = setup();
 			coordinator.beginDiagnosis();
 			coordinator.state.attempts[0].result = {
 				runId: run.runId,
@@ -100,8 +101,8 @@ describe("Sure final user report", () => {
 		},
 	);
 
-	it("keeps confirmed execution facts, proposed causes and unknowns separate in persisted output", async () => {
-		const { run, coordinator } = await setup();
+	it("keeps confirmed execution facts, proposed causes and unknowns separate in persisted output", () => {
+		const { run, coordinator } = setup();
 		coordinator.beginDiagnosis();
 		coordinator.state.attempts[0].result = {
 			runId: run.runId,
@@ -141,21 +142,8 @@ describe("Sure final user report", () => {
 		).toBe("Build model environment");
 	});
 
-	it("explains an unavailable supervisor without replacing the original task failure or calling a provider", async () => {
-		const { harness, run, coordinator } = await setup();
-		coordinator.beginDiagnosis();
-		coordinator.state.attempts[0].error = "Supervisor provider unavailable.";
-		coordinator.stop("Supervisor provider unavailable.");
-		harness.setResponses([]);
-		const report = buildSureFailureReport(run, coordinator, display);
-		expect(report.facts).toContain("Original CUDA import failed.");
-		expect(report.diagnosisStatus).toBe("unavailable");
-		expect(report.stopReason).toContain("Supervisor provider unavailable");
-		expect(harness.getPendingResponseCount()).toBe(0);
-	});
-
-	it("does not offer resume for an exhausted, cancelled or incomplete terminal run", async () => {
-		const { run, coordinator } = await setup();
+	it("does not offer resume for an exhausted, cancelled or incomplete terminal run", () => {
+		const { run, coordinator } = setup();
 		coordinator.observe({ ...coordinator.state.lastCheck!, outcome: "exhausted" }, []);
 		expect(buildSureFailureReport(run, coordinator, display).resumeCommand).toBeUndefined();
 		coordinator.stop("User cancelled.", true);
@@ -171,8 +159,8 @@ describe("Sure final user report", () => {
 		});
 	});
 
-	it("shows the conclusion and next action first while retaining the full detailed report", async () => {
-		const { run, coordinator } = await setup();
+	it("shows the conclusion and next action first while retaining the full detailed report", () => {
+		const { run, coordinator } = setup();
 		coordinator.stop("Required CUDA runtime is unavailable.");
 		const report = buildSureFailureReport(run, coordinator, display);
 		const collapsed = renderSureFailureReport(report, false);

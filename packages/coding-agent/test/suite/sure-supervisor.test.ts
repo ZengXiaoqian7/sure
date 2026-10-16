@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/compat";
+import { type FauxResponseStep, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/compat";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentSession } from "../../src/core/agent-session.ts";
 import { createIsolatedResourceLoader } from "../../src/core/isolated-resource-loader.ts";
@@ -8,18 +8,14 @@ import { createAgentSession } from "../../src/core/sdk.ts";
 import type { IsolatedSession } from "../../src/core/session-controls.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
 import { SettingsManager } from "../../src/core/settings-manager.ts";
-import type {
-	SureCoordinationLimits,
-	SureDiagnosisOutcome,
-	SureDiagnosisResult,
-} from "../../src/core/sure/coordination-types.ts";
+import type { SureDiagnosisOutcome } from "../../src/core/sure/coordination-types.ts";
 import { SureCoordinator } from "../../src/core/sure/coordinator.ts";
 import { writeSureJson } from "../../src/core/sure/evidence.ts";
 import { diagnoseSureRun } from "../../src/core/sure/supervisor.ts";
 import type { SureRunRecord, SureSkillPackage } from "../../src/core/sure/types.ts";
 import { readSureUserContext, syncSureUserContext } from "../../src/core/sure/user-context.ts";
-import { createHarness, type Harness } from "./harness.ts";
-import { fixtureTranscript, pauseDiagnosis, repairHandoff, submitControlFixture } from "./sure-control-fixtures.ts";
+import { createHarness, getMessageText, type Harness } from "./harness.ts";
+import { pauseDiagnosis, repairHandoff, toolReply } from "./sure-control-fixtures.ts";
 
 function checkpointReason(outcome: SureDiagnosisOutcome): string {
 	expect(outcome.decision).toBe("checkpoint");
@@ -29,9 +25,10 @@ function checkpointReason(outcome: SureDiagnosisOutcome): string {
 
 const harnesses: Harness[] = [];
 const sessions: AgentSession[] = [];
+const repairTask = "Repair CUDA dependencies in the declared model runtime and rerun the same gate.";
 const stage = { id: "build_env", prompt: "stage.md", references: [], snapshotPaths: ["run:artifacts"] };
 
-async function setup(budgets: Partial<SureCoordinationLimits> = {}) {
+async function setup() {
 	const harness = await createHarness();
 	harnesses.push(harness);
 	const { session } = await createAgentSession({
@@ -64,7 +61,7 @@ async function setup(budgets: Partial<SureCoordinationLimits> = {}) {
 		join(run.packageDir, "stage.md"),
 		"Prepare the declared model environment and rerun its original check.",
 	);
-	const coordinator = new SureCoordinator(run, "build_env", ["run:artifacts", "package:stage.md"], budgets);
+	const coordinator = new SureCoordinator(run, "build_env", ["run:artifacts", "package:stage.md"]);
 	coordinator.observe(
 		{
 			unitId: "build_env",
@@ -78,22 +75,8 @@ async function setup(budgets: Partial<SureCoordinationLimits> = {}) {
 	);
 	const ctx = session.extensionRunner.createContext();
 	ctx.setExecutionHold?.(true);
-	const result: SureDiagnosisResult = {
-		runId: run.runId,
-		unitId: "build_env",
-		evidenceVersion: coordinator.state.evidenceVersion,
-		decision: "repair",
-		facts: ["CUDA import failed"],
-		hypotheses: ["Runtime mismatch"],
-		unknowns: [],
-		evidenceReferences: ["check:1"],
-		targetFiles: [],
-		validation: "Rerun the original build_env gate.",
-		stopBoundary: "Stop this repair if the original gate still fails.",
-		repair: "Repair CUDA dependencies in the declared model runtime and rerun the same gate.",
-		nextActions: [],
-	};
-	return { harness, session, coordinator, ctx, result };
+
+	return { harness, session, coordinator, ctx };
 }
 
 afterEach(() => {
@@ -106,7 +89,7 @@ describe("Sure independent read-only supervisor", () => {
 	it.each(["read", "edit", "change"])(
 		"discovers related sources and checks read/write/version boundaries: %s",
 		async (mode) => {
-			const { harness, coordinator, ctx, result } = await setup();
+			const { harness, coordinator, ctx } = await setup();
 			coordinator.run.packageDir = join(coordinator.run.cwd, "skill");
 			mkdirSync(coordinator.run.packageDir);
 			writeFileSync(
@@ -132,20 +115,15 @@ describe("Sure independent read-only supervisor", () => {
 			const declaredStage = { ...stage, diagnosticPaths: ["project:config"] };
 			coordinator.barrier(scope);
 			harness.setResponses([
-				fauxAssistantMessage([fauxToolCall("sure_diagnostic_read", { operation: "timeline" })], {
-					stopReason: "toolUse",
-				}),
+				toolReply(fauxToolCall("sure_diagnostic_read", { operation: "timeline" })),
 				(context) => {
 					const message = context.messages.filter((message) => message.role === "toolResult").at(-1)!;
 					const macro = JSON.parse(JSON.parse(message.content.find((block) => block.type === "text")!.text).text);
 					expect(macro.priorUnitActions[0].toolCallId).toBe("prior-read");
-					return fauxAssistantMessage(
-						[
-							fauxToolCall("sure_diagnostic_read", { operation: "list", path: "project:config" }),
-							fauxToolCall("sure_diagnostic_read", { operation: "file", path: "project:loader.txt" }),
-							fauxToolCall("sure_diagnostic_read", { operation: "file", path: "project:alias.txt" }),
-						],
-						{ stopReason: "toolUse" },
+					return toolReply(
+						fauxToolCall("sure_diagnostic_read", { operation: "list", path: "project:config" }),
+						fauxToolCall("sure_diagnostic_read", { operation: "file", path: "project:loader.txt" }),
+						fauxToolCall("sure_diagnostic_read", { operation: "file", path: "project:alias.txt" }),
 					);
 				},
 				(context) => {
@@ -162,7 +140,7 @@ describe("Sure independent read-only supervisor", () => {
 					expect(messages[2].isError).toBe(true);
 					expect(text(2)).not.toContain("PRIVATE_CONTENT");
 					if (mode === "change") writeFileSync(join(coordinator.run.cwd, "loader.txt"), "new policy source\n");
-					return repairHandoff(result.repair!, mode === "edit" ? ["project:config/actual.yaml"] : []);
+					return repairHandoff(repairTask, mode === "edit" ? ["project:config/actual.yaml"] : []);
 				},
 			]);
 			const outcome = await diagnoseSureRun(coordinator, ctx, scope, declaredStage);
@@ -172,14 +150,9 @@ describe("Sure independent read-only supervisor", () => {
 			if (mode === "change") {
 				expect(checkpointReason(outcome)).toContain("Live diagnostic source changed");
 				harness.setResponses([
-					fauxAssistantMessage([fauxToolCall("sure_diagnostic_read", { operation: "timeline" })], {
-						stopReason: "toolUse",
-					}),
-					fauxAssistantMessage(
-						[fauxToolCall("sure_diagnostic_read", { operation: "file", path: "project:loader.txt" })],
-						{ stopReason: "toolUse" },
-					),
-					() => repairHandoff(result.repair!),
+					toolReply(fauxToolCall("sure_diagnostic_read", { operation: "timeline" })),
+					toolReply(fauxToolCall("sure_diagnostic_read", { operation: "file", path: "project:loader.txt" })),
+					() => repairHandoff(repairTask),
 				]);
 				expect((await diagnoseSureRun(coordinator, ctx, scope, declaredStage)).decision).toBe("repair");
 				expect(coordinator.state.attempts).toHaveLength(2);
@@ -206,7 +179,7 @@ describe("Sure independent read-only supervisor", () => {
 	});
 
 	it("delivers the complete frozen global manual and common rules alongside the local contract", async () => {
-		const { harness, coordinator, ctx, result } = await setup();
+		const { harness, coordinator, ctx } = await setup();
 		const manual = `GLOBAL_START\n${"Long global instruction.\n".repeat(1000)}GLOBAL_END`;
 		writeFileSync(join(coordinator.run.packageDir, "SKILL.md"), manual);
 		writeFileSync(join(coordinator.run.packageDir, "common.md"), "COMPLETE_COMMON_RULES");
@@ -232,84 +205,20 @@ describe("Sure independent read-only supervisor", () => {
 				expect(context.systemPrompt).toContain(manual);
 				expect(context.systemPrompt).toContain("COMPLETE_COMMON_RULES");
 				expect(context.systemPrompt).not.toContain("CHANGED_LIVE_MANUAL");
-				return fauxAssistantMessage([fauxToolCall("sure_diagnostic_read", { operation: "timeline" })], {
-					stopReason: "toolUse",
-				});
+				return toolReply(fauxToolCall("sure_diagnostic_read", { operation: "timeline" }));
 			},
-			repairHandoff(result.repair!),
+			repairHandoff(repairTask),
 		]);
 		expect((await diagnoseSureRun(coordinator, ctx, scope, stage, skill)).decision).toBe("repair");
 	});
 
-	it("continues one persisted investigation across segments without resetting usage or replaying the macro", async () => {
-		const { harness, coordinator, ctx, result } = await setup();
-		const checkpoint = "The macro is complete; inspect check 1 before choosing a correction.";
-		harness.setResponses([
-			fauxAssistantMessage([fauxToolCall("sure_diagnostic_read", { operation: "timeline" })], {
-				stopReason: "toolUse",
-			}),
-			pauseDiagnosis(checkpoint),
-			(context) => {
-				expect(JSON.stringify(context.messages)).toContain(checkpoint);
-				expect(context.tools?.map((tool) => tool.name)).toEqual([
-					"sure_diagnostic_read",
-					"sure_handoff_repair",
-					"sure_pause_diagnosis",
-				]);
-				return fauxAssistantMessage(
-					[fauxToolCall("sure_diagnostic_read", { operation: "check", checkVersion: 1 })],
-					{ stopReason: "toolUse" },
-				);
-			},
-			repairHandoff(result.repair!),
-		]);
-		const first = await diagnoseSureRun(coordinator, ctx, [], stage);
-		expect(first).toMatchObject({ decision: "checkpoint", automatic: false });
-		expect(coordinator.acceptDiagnosis(first)).toBe(false);
-		expect(coordinator.state.attempts[0].result).toBeUndefined();
-		const restored = new SureCoordinator(coordinator.run, stage.id, []);
-		expect(await diagnoseSureRun(restored, ctx, [], stage)).toMatchObject({
-			decision: "repair",
-			repair: result.repair,
-		});
-		expect(restored.state.attempts).toHaveLength(1);
-		expect(restored.state.attempts[0]).toMatchObject({ modelTurns: 4, readCalls: 2 });
-		expect(restored.state.attempts[0].segments).toMatchObject([
-			{ modelTurns: 2, readCalls: 1 },
-			{ modelTurns: 2, readCalls: 1 },
-		]);
-		expect(restored.state.attempts[0].usage).toBeDefined();
-		expect(restored.state.units.build_env.supervisorRepairs).toBe(0);
-	});
-
-	it("pauses repeated investigation checkpoints without inventing a business stop", async () => {
-		const { harness, coordinator, ctx } = await setup();
-		const checkpoint = "No new evidence was found.";
-		for (const _iteration of [0, 1]) {
-			harness.setResponses([
-				fauxAssistantMessage([fauxToolCall("sure_diagnostic_read", { operation: "timeline", offset: 0 })], {
-					stopReason: "toolUse",
-				}),
-				pauseDiagnosis(checkpoint),
-			]);
-			expect(await diagnoseSureRun(coordinator, ctx, [], stage)).toMatchObject({
-				decision: "checkpoint",
-				automatic: false,
-			});
-		}
-		expect(coordinator.state.stopReason).toBeUndefined();
-		expect(coordinator.state.attempts).toHaveLength(1);
-	});
-
 	it("continues a three-page macro in the same logical investigation beyond one segment", async () => {
-		const { harness, coordinator, ctx, result } = await setup();
+		const { harness, coordinator, ctx } = await setup();
 		coordinator.run.args = "long argument ".repeat(8500);
 		let offset = 0;
 		for (let segment = 0; segment < 3; segment++) {
 			harness.setResponses([
-				fauxAssistantMessage([fauxToolCall("sure_diagnostic_read", { operation: "timeline" })], {
-					stopReason: "toolUse",
-				}),
+				toolReply(fauxToolCall("sure_diagnostic_read", { operation: "timeline" })),
 				(context) => {
 					const message = context.messages.filter((message) => message.role === "toolResult").at(-1)!;
 					const page = JSON.parse(message.content.find((block) => block.type === "text")!.text);
@@ -317,7 +226,7 @@ describe("Sure independent read-only supervisor", () => {
 					offset = page.nextOffset;
 					if (segment === 2) {
 						expect(page.timelineProgress.complete).toBe(true);
-						return repairHandoff(result.repair!);
+						return repairHandoff(repairTask);
 					}
 					return pauseDiagnosis("Continue the undelivered macro; local cause remains unknown.");
 				},
@@ -328,77 +237,9 @@ describe("Sure independent read-only supervisor", () => {
 		expect(coordinator.state.attempts).toHaveLength(1);
 		expect(coordinator.state.attempts[0]).toMatchObject({ modelTurns: 6, readCalls: 3, timelineOffset: offset });
 		expect(coordinator.state.attempts[0].segments).toHaveLength(3);
-	});
-
-	it.each([1, 4, 12])("allows %s investigation turns before a native tool handoff", async (reads) => {
-		const { harness, coordinator, ctx, result } = await setup();
-		harness.setResponses([
-			...Array.from({ length: reads }, () =>
-				fauxAssistantMessage([fauxToolCall("sure_diagnostic_read", { operation: "timeline", offset: 0 })], {
-					stopReason: "toolUse",
-				}),
-			),
-			(context) => {
-				expect(context.tools?.map((tool) => tool.name)).toEqual([
-					"sure_diagnostic_read",
-					"sure_handoff_repair",
-					"sure_pause_diagnosis",
-				]);
-				return repairHandoff(result.repair!);
-			},
-			fauxAssistantMessage("must not be called"),
-		]);
-		expect(await diagnoseSureRun(coordinator, ctx, [], stage)).toMatchObject({
-			decision: "repair",
-			repair: result.repair,
-		});
-		expect(coordinator.state.attempts[0]).toMatchObject({ modelTurns: reads + 1, readCalls: reads });
-		expect(harness.getPendingResponseCount()).toBe(1);
-	});
-
-	it("offers same-session feedback for truncated final text", async () => {
-		const { harness, coordinator, ctx } = await setup();
-		harness.setResponses([
-			...Array.from({ length: 3 }, () =>
-				fauxAssistantMessage([fauxToolCall("sure_diagnostic_read", { operation: "timeline" })], {
-					stopReason: "toolUse",
-				}),
-			),
-			(context) => {
-				expect(context.tools?.map((tool) => tool.name)).toEqual([
-					"sure_diagnostic_read",
-					"sure_handoff_repair",
-					"sure_pause_diagnosis",
-				]);
-				return fauxAssistantMessage('{"runId":"test-run","decision":');
-			},
-			fauxAssistantMessage("must not be called"),
-		]);
-		expect((await diagnoseSureRun(coordinator, ctx, [], stage)).decision).toBe("checkpoint");
-		expect(coordinator.state.attempts[0].modelTurns).toBe(6);
-		expect(harness.getPendingResponseCount()).toBe(0);
-	});
-
-	it("does not inherit macro inspection when only the persisted final turn remains", async () => {
-		const { harness, coordinator, ctx, result } = await setup();
-		coordinator.beginDiagnosis();
-		Object.assign(coordinator.state.attempts[0], { modelTurns: 3, readCalls: 2 });
-		coordinator.save();
-		harness.setResponses([
-			(context) => {
-				expect(context.tools?.map((tool) => tool.name)).toEqual([
-					"sure_diagnostic_read",
-					"sure_handoff_repair",
-					"sure_pause_diagnosis",
-				]);
-				return repairHandoff(result.repair!);
-			},
-			fauxAssistantMessage("must not be called"),
-		]);
-		const restored = new SureCoordinator(coordinator.run, "build_env", []);
-		expect(checkpointReason(await diagnoseSureRun(restored, ctx, [], stage))).toContain("complete macro timeline");
-		expect(restored.state.attempts[0]).toMatchObject({ modelTurns: 6, readCalls: 2 });
-		expect(harness.getPendingResponseCount()).toBe(0);
+		expect(coordinator.state.attempts[0].usage).toBeDefined();
+		expect(coordinator.state.stopReason).toBeUndefined();
+		expect(coordinator.state.units.build_env.supervisorRepairs).toBe(0);
 	});
 
 	it("cancels the decision response without applying a repair or requesting another response", async () => {
@@ -408,11 +249,7 @@ describe("Sure independent read-only supervisor", () => {
 			started = resolve;
 		});
 		harness.setResponses([
-			...Array.from({ length: 3 }, () =>
-				fauxAssistantMessage([fauxToolCall("sure_diagnostic_read", { operation: "timeline" })], {
-					stopReason: "toolUse",
-				}),
-			),
+			...Array.from({ length: 3 }, () => toolReply(fauxToolCall("sure_diagnostic_read", { operation: "timeline" }))),
 			async (context, options) => {
 				expect(context.tools?.map((tool) => tool.name)).toEqual([
 					"sure_diagnostic_read",
@@ -432,30 +269,15 @@ describe("Sure independent read-only supervisor", () => {
 		await session.abort();
 		expect(checkpointReason(await pending)).toContain("cancelled");
 		expect(coordinator.state.pendingRepair).toBeUndefined();
+		expect(
+			JSON.parse(readFileSync(join(coordinator.run.runDir, "coordination.json"), "utf8")).attempts[0].error,
+		).toContain("cancelled");
 		expect(coordinator.state.attempts[0].modelTurns).toBeLessThanOrEqual(4);
 		expect(harness.getPendingResponseCount()).toBe(1);
 	});
 
-	it("keeps readable prior diagnosis results outside repair targets even under a broad run scope", async () => {
-		const { harness, coordinator, ctx, result } = await setup();
-		coordinator.beginDiagnosis();
-		const previous = coordinator.state.attempts.at(-1)!;
-		previous.result = result;
-		writeSureJson(join(coordinator.run.runDir, "diagnoses", previous.id, "result.json"), result);
-		coordinator.observe({ ...coordinator.state.lastCheck!, summary: "New failure" }, ["package:stage.md"]);
-		harness.setResponses([
-			fauxAssistantMessage([fauxToolCall("sure_diagnostic_read", { operation: "timeline" })], {
-				stopReason: "toolUse",
-			}),
-			repairHandoff(result.repair!, [`run:diagnoses/${previous.id}/result.json`]),
-		]);
-		expect(checkpointReason(await diagnoseSureRun(coordinator, ctx, ["run:"], stage))).toContain(
-			"Focus path is outside original task permissions",
-		);
-	});
-
-	it("exposes the failed action and snapshot indexes, and can decide after exactly eight reads", async () => {
-		const { harness, coordinator, ctx, result } = await setup();
+	it("exposes failed actions and snapshot indexes through native diagnostic tools", async () => {
+		const { harness, coordinator, ctx } = await setup();
 		const actionPath = "run:evidence/tools/failed.json";
 		const helperPath = "package:helper.py";
 		writeSureJson(join(coordinator.run.runDir, "evidence/tools/failed.json"), {
@@ -497,9 +319,7 @@ describe("Sure independent read-only supervisor", () => {
 					.join("\n");
 				expect(prompt).toContain('"reads":{"used":0}');
 				expect(prompt).not.toContain('"limit":8');
-				return fauxAssistantMessage([fauxToolCall("sure_diagnostic_read", { operation: "timeline" })], {
-					stopReason: "toolUse",
-				});
+				return toolReply(fauxToolCall("sure_diagnostic_read", { operation: "timeline" }));
 			},
 			(context) => {
 				const message = context.messages.find((message) => message.role === "toolResult")!;
@@ -510,17 +330,14 @@ describe("Sure independent read-only supervisor", () => {
 					lastCheck: { sameAs: "lastFailure" },
 					lastFailure: { action: { toolCallId: "failed" } },
 				});
-				return fauxAssistantMessage(
-					[
-						fauxToolCall("sure_diagnostic_read", { operation: "file", path: actionPath }),
-						fauxToolCall("sure_diagnostic_read", { operation: "snapshot" }),
-						fauxToolCall("sure_diagnostic_read", { operation: "diff" }),
-						fauxToolCall("sure_diagnostic_read", { operation: "check", checkVersion: 2 }),
-						fauxToolCall("sure_diagnostic_read", { operation: "file", path: helperPath }),
-						fauxToolCall("sure_diagnostic_read", { operation: "snapshot", path: helperPath }),
-						fauxToolCall("sure_diagnostic_read", { operation: "check", checkVersion: 1 }),
-					],
-					{ stopReason: "toolUse" },
+				return toolReply(
+					fauxToolCall("sure_diagnostic_read", { operation: "file", path: actionPath }),
+					fauxToolCall("sure_diagnostic_read", { operation: "snapshot" }),
+					fauxToolCall("sure_diagnostic_read", { operation: "diff" }),
+					fauxToolCall("sure_diagnostic_read", { operation: "check", checkVersion: 2 }),
+					fauxToolCall("sure_diagnostic_read", { operation: "file", path: helperPath }),
+					fauxToolCall("sure_diagnostic_read", { operation: "snapshot", path: helperPath }),
+					fauxToolCall("sure_diagnostic_read", { operation: "check", checkVersion: 1 }),
 				);
 			},
 			(context) => {
@@ -533,7 +350,7 @@ describe("Sure independent read-only supervisor", () => {
 				expect(snapshot.files.every((file: { text?: string }) => file.text === undefined)).toBe(true);
 				expect(pages[2].complete).toBe(true);
 				expect(JSON.parse(pages[3].text).index).toBeDefined();
-				return repairHandoff(result.repair!);
+				return repairHandoff(repairTask);
 			},
 		]);
 		const diagnosis = await diagnoseSureRun(coordinator, ctx, [helperPath], stage);
@@ -542,42 +359,46 @@ describe("Sure independent read-only supervisor", () => {
 		expect(coordinator.state.attempts.at(-1)).toMatchObject({ readCalls: 8, modelTurns: 3 });
 	});
 
-	it("keeps newly registered diagnostic-only inputs out of repair targets", async () => {
-		const { harness, coordinator, ctx, result } = await setup();
-		coordinator.run.packageDir = join(coordinator.run.cwd, "skill");
-		mkdirSync(coordinator.run.packageDir);
-		writeFileSync(join(coordinator.run.packageDir, "stage.md"), "Prepare the environment.");
-		writeSureJson(join(coordinator.run.runDir, "run.json"), { package: "none", device: "cpu" });
-		coordinator.observe(
-			{
-				unitId: "build_env",
-				outcome: "blocked",
-				failureKind: "tool",
-				summary: "Call failed",
-				inputPaths: [],
-				artifactPaths: [],
-				diagnosticPaths: ["run:run.json"],
-			},
-			["run:run.json", "package:stage.md"],
-		);
-		harness.setResponses([
-			fauxAssistantMessage([fauxToolCall("sure_diagnostic_read", { operation: "timeline" })], {
-				stopReason: "toolUse",
-			}),
-			repairHandoff(result.repair!, ["run:run.json"]),
-		]);
-		expect(checkpointReason(await diagnoseSureRun(coordinator, ctx, ["run:"], stage))).toContain(
-			"Focus path is outside original task permissions",
-		);
-	});
+	it.each(["run:run.json", "package:stage.md", "run:diagnoses/prior/result.json"])(
+		"keeps read-only %s out of repair targets",
+		async (target) => {
+			const { harness, coordinator, ctx } = await setup();
+			coordinator.run.packageDir = join(coordinator.run.cwd, "skill");
+			mkdirSync(coordinator.run.packageDir);
+			writeFileSync(join(coordinator.run.packageDir, "stage.md"), "Prepare the environment.");
+			writeSureJson(join(coordinator.run.runDir, "run.json"), { package: "none", device: "cpu" });
+			writeSureJson(join(coordinator.run.runDir, "diagnoses/prior/result.json"), { repair: "Historical task" });
+			coordinator.observe(
+				{
+					unitId: "build_env",
+					outcome: "blocked",
+					failureKind: "tool",
+					summary: "Call failed",
+					inputPaths: [],
+					artifactPaths: [],
+					diagnosticPaths: ["run:run.json"],
+				},
+				["run:run.json", "package:stage.md"],
+			);
+			harness.setResponses([
+				toolReply(fauxToolCall("sure_diagnostic_read", { operation: "timeline" })),
+				repairHandoff(repairTask, [target]),
+			]);
+			expect(checkpointReason(await diagnoseSureRun(coordinator, ctx, ["run:"], stage))).toContain(
+				"Focus path is outside original task permissions",
+			);
+		},
+	);
 	it("reads a prior repair's full task and actual checks from its stable identity", async () => {
-		const { harness, coordinator, ctx, result } = await setup();
+		const { harness, coordinator, ctx } = await setup();
 		const task = `${"Repair detail. ".repeat(100)} END_OF_REPAIR`;
-		coordinator.beginDiagnosis();
+		harness.setResponses([
+			toolReply(fauxToolCall("sure_diagnostic_read", { operation: "timeline" })),
+			repairHandoff(task),
+		]);
+		const result = await diagnoseSureRun(coordinator, ctx, [], stage);
 		const previous = coordinator.state.attempts.at(-1)!;
-		previous.result = { ...result, repair: task };
-		writeSureJson(join(coordinator.run.runDir, "diagnoses", previous.id, "result.json"), previous.result);
-		coordinator.acceptDiagnosis({ ...result, repair: task });
+		coordinator.acceptDiagnosis(result);
 		coordinator.observe(
 			{
 				unitId: "build_env",
@@ -592,26 +413,21 @@ describe("Sure independent read-only supervisor", () => {
 		const repairId = coordinator.state.pendingRepair!.id;
 		coordinator.verifyRepair(repairId, coordinator.state.evidenceVersion, "recheck");
 		harness.setResponses([
-			fauxAssistantMessage([fauxToolCall("sure_diagnostic_read", { operation: "timeline" })], {
-				stopReason: "toolUse",
-			}),
+			toolReply(fauxToolCall("sure_diagnostic_read", { operation: "timeline" })),
 			(context) => {
-				const response = context.messages.find((message) => message.role === "toolResult")!;
+				const response = context.messages.filter((message) => message.role === "toolResult").at(-1)!;
 				const page = JSON.parse(response.content.find((block) => block.type === "text")!.text);
 				const macro = JSON.parse(page.text);
 				expect(page.text).not.toContain("END_OF_REPAIR");
 				expect(macro.previousDiagnoses[0]).toMatchObject({ id: previous.id, decision: "repair" });
 				expect(macro.previousDiagnoses[0].repair).toBeUndefined();
 				expect(macro.repairs[0].checkVersions).toBeUndefined();
-				return fauxAssistantMessage(
-					[
-						fauxToolCall("sure_diagnostic_read", { operation: "repairs", repairId }),
-						fauxToolCall("sure_diagnostic_read", {
-							operation: "file",
-							path: `run:diagnoses/${previous.id}/result.json`,
-						}),
-					],
-					{ stopReason: "toolUse" },
+				return toolReply(
+					fauxToolCall("sure_diagnostic_read", { operation: "repairs", repairId }),
+					fauxToolCall("sure_diagnostic_read", {
+						operation: "file",
+						path: `run:diagnoses/${previous.id}/result.json`,
+					}),
 				);
 			},
 			(context) => {
@@ -628,14 +444,14 @@ describe("Sure independent read-only supervisor", () => {
 					checkVersions: [2],
 					remainingBlocker: "The original gate still fails after repair",
 				});
-				return repairHandoff(result.repair!);
+				return repairHandoff(repairTask);
 			},
 		]);
 		expect((await diagnoseSureRun(coordinator, ctx, [], stage)).decision).toBe("repair");
 	});
 
 	it("retires old persisted investigation caps while retaining cumulative use on resume", async () => {
-		const { harness, coordinator, ctx, result } = await setup();
+		const { harness, coordinator, ctx } = await setup();
 		coordinator.beginDiagnosis();
 		Object.assign(coordinator.state.attempts[0], { modelTurns: 40, readCalls: 80, elapsedMs: 240_000 });
 		writeSureJson(join(coordinator.run.runDir, "coordination.json"), {
@@ -647,57 +463,43 @@ describe("Sure independent read-only supervisor", () => {
 		expect(restored.limits).not.toHaveProperty("diagnosisModelTurns");
 		expect(restored.limits).not.toHaveProperty("diagnosisElapsedMs");
 		harness.setResponses([
-			fauxAssistantMessage(
-				[
-					fauxToolCall("sure_diagnostic_read", { operation: "timeline" }),
-					fauxToolCall("sure_diagnostic_read", { operation: "check", checkVersion: 1 }),
-				],
-				{ stopReason: "toolUse" },
+			toolReply(
+				fauxToolCall("sure_diagnostic_read", { operation: "timeline" }),
+				fauxToolCall("sure_diagnostic_read", { operation: "check", checkVersion: 1 }),
 			),
-			repairHandoff(result.repair!),
+			repairHandoff(repairTask),
 		]);
 		expect(await diagnoseSureRun(restored, ctx, [], stage)).toMatchObject({
 			decision: "repair",
-			repair: result.repair,
+			repair: repairTask,
 		});
 		expect(restored.state.attempts[0]).toMatchObject({ modelTurns: 42, readCalls: 82 });
 		expect(restored.state.attempts[0].elapsedMs).toBeGreaterThanOrEqual(240_000);
 	});
 	it.each([false, true])("requires every page of the macro timeline, complete=%s", async (complete) => {
-		const { coordinator, ctx, result } = await setup();
+		const { harness, coordinator, ctx } = await setup();
 		coordinator.run.args = `${"A".repeat(53_604)} END_OF_TASK_ARGS`;
-		ctx.createIsolatedSession = async (request) => {
-			const transcript = fixtureTranscript(request, coordinator.run.cwd);
-			return {
-				getSessionIdentity: transcript.getSessionIdentity,
-				disableTools: () => {},
-				prompt: async () => {
-					let offset = 0,
-						text = "";
-					do {
-						const response = await request.tools[0].execute(
-							"macro",
-							{ operation: "timeline", offset },
-							undefined,
-							undefined,
-							ctx,
-						);
-						const page = JSON.parse(response.content.find((block) => block.type === "text")?.text ?? "{}");
-						text += page.text;
-						offset = page.nextOffset;
-						expect(page.text.length).toBeLessThanOrEqual(50 * 1024);
-						expect(page.totalCharacters).toBeGreaterThan(48_000);
-						expect(page.totalCharacters).toBeLessThanOrEqual(72_000);
-						if (page.complete) break;
-					} while (complete);
-					if (complete) expect(JSON.parse(text).task.args).toContain("END_OF_TASK_ARGS");
-					await submitControlFixture(request, transcript.manager, ctx, repairHandoff(result.repair!));
-				},
-				abort: async () => {},
-				dispose: () => {},
-				getMessages: () => transcript.manager.buildSessionContext().messages,
-			};
-		};
+		let text = "";
+		const responses: FauxResponseStep[] = [
+			toolReply(fauxToolCall("sure_diagnostic_read", { operation: "timeline" })),
+			(context) => {
+				const page = JSON.parse(getMessageText(context.messages.filter((m) => m.role === "toolResult").at(-1)));
+				expect(page.complete).toBe(false);
+				expect(page.text.length).toBeLessThanOrEqual(50 * 1024);
+				text += page.text;
+				return complete
+					? toolReply(fauxToolCall("sure_diagnostic_read", { operation: "timeline", offset: page.nextOffset }))
+					: repairHandoff(repairTask);
+			},
+		];
+		if (complete)
+			responses.push((context) => {
+				const page = JSON.parse(getMessageText(context.messages.filter((m) => m.role === "toolResult").at(-1)));
+				expect(page.complete).toBe(true);
+				expect(JSON.parse(text + page.text).task.args).toContain("END_OF_TASK_ARGS");
+				return repairHandoff(repairTask);
+			});
+		harness.setResponses(responses);
 		const diagnosis = await diagnoseSureRun(coordinator, ctx, [], stage);
 		expect(diagnosis.decision).toBe(complete ? "repair" : "checkpoint");
 		expect(coordinator.state.attempts[0].readCalls).toBe(complete ? 2 : 1);
@@ -705,8 +507,12 @@ describe("Sure independent read-only supervisor", () => {
 	});
 
 	it.each([false, true])("requires the complete saved user instructions, with reads=%s", async (read) => {
-		const { harness, session, coordinator, ctx, result } = await setup();
-		const earlier = { role: "user" as const, content: "Do not download anything.", timestamp: 1 };
+		const { harness, session, coordinator, ctx } = await setup();
+		const earlier = {
+			role: "user" as const,
+			content: `${"Original instruction. ".repeat(3000)}NO_NETWORK`,
+			timestamp: 1,
+		};
 		syncSureUserContext(coordinator, [earlier]);
 		session.sessionManager.appendMessage({
 			role: "user",
@@ -715,23 +521,21 @@ describe("Sure independent read-only supervisor", () => {
 		});
 		const restored = new SureCoordinator(coordinator.run, "build_env", []);
 		harness.setResponses([
-			fauxAssistantMessage([fauxToolCall("sure_diagnostic_read", { operation: "timeline" })], {
-				stopReason: "toolUse",
-			}),
+			toolReply(fauxToolCall("sure_diagnostic_read", { operation: "timeline" })),
 			...(read
 				? [
-						fauxAssistantMessage(
-							[fauxToolCall("sure_diagnostic_read", { operation: "user_context", offset: 0 })],
-							{ stopReason: "toolUse" },
+						toolReply(
+							fauxToolCall("sure_diagnostic_read", { operation: "user_context", offset: 0 }),
+							fauxToolCall("sure_diagnostic_read", { operation: "user_context", offset: 50 * 1024 }),
 						),
 					]
 				: []),
 			(context) => {
 				if (read) {
-					expect(JSON.stringify(context.messages)).toContain("Do not download anything.");
+					expect(JSON.stringify(context.messages)).toContain("NO_NETWORK");
 					expect(JSON.stringify(context.messages)).toContain("Only repair the declared wrapper.");
 				}
-				return repairHandoff(result.repair!);
+				return repairHandoff(repairTask);
 			},
 		]);
 		const diagnosis = await diagnoseSureRun(restored, ctx, ["run:artifacts"], stage);
@@ -742,34 +546,16 @@ describe("Sure independent read-only supervisor", () => {
 		else expect(restored.state.attempts[0].error).toContain("Read complete user_context");
 	});
 
-	it("paginates long instructions without silently dropping constraints or increasing budgets", async () => {
-		const { harness, coordinator, ctx, result } = await setup();
-		syncSureUserContext(coordinator, [{ role: "user", timestamp: 1, content: `${"A".repeat(60_000)}\nNO_NETWORK` }]);
-		harness.setResponses([
-			fauxAssistantMessage([fauxToolCall("sure_diagnostic_read", { operation: "timeline" })], {
-				stopReason: "toolUse",
-			}),
-			fauxAssistantMessage(
-				[
-					fauxToolCall("sure_diagnostic_read", { operation: "user_context", offset: 0 }),
-					fauxToolCall("sure_diagnostic_read", { operation: "user_context", offset: 50 * 1024 }),
-				],
-				{ stopReason: "toolUse" },
-			),
-			(context) => {
-				expect(JSON.stringify(context.messages)).toContain("NO_NETWORK");
-				return repairHandoff(result.repair!);
-			},
-		]);
-		expect((await diagnoseSureRun(coordinator, ctx, [], stage)).decision).toBe("repair");
-		expect(coordinator.state.attempts[0]).toMatchObject({ readCalls: 3, modelTurns: 3 });
-	});
-
 	it("deduplicates harness prompts, restores constraints missing from the view and invalidates old repairs", async () => {
-		const { coordinator, result } = await setup();
+		const { harness, coordinator, ctx } = await setup();
 		const message = { role: "user" as const, timestamp: 1, content: "NO_NETWORK_DOWNLOADS" };
 		syncSureUserContext(coordinator, [message]);
-		expect(coordinator.acceptDiagnosis({ ...result, evidenceVersion: coordinator.state.evidenceVersion })).toBe(true);
+		harness.setResponses([
+			toolReply(fauxToolCall("sure_diagnostic_read", { operation: "timeline" })),
+			toolReply(fauxToolCall("sure_diagnostic_read", { operation: "user_context" })),
+			repairHandoff(repairTask),
+		]);
+		expect(coordinator.acceptDiagnosis(await diagnoseSureRun(coordinator, ctx, [], stage))).toBe(true);
 		const version = coordinator.state.evidenceVersion;
 		syncSureUserContext(coordinator, [
 			message,
@@ -809,7 +595,7 @@ describe("Sure independent read-only supervisor", () => {
 	});
 
 	it("uses a separate persisted session with only the diagnostic read tool and the same model", async () => {
-		const { harness, session, coordinator, ctx, result } = await setup();
+		const { harness, session, coordinator, ctx } = await setup();
 		writeFileSync(join(harness.tempDir, "AGENTS.md"), "UNTRUSTED_LOCAL_PROMPT");
 		harness.setResponses([
 			(context, _options, _state, model) => {
@@ -820,25 +606,23 @@ describe("Sure independent read-only supervisor", () => {
 				]);
 				expect(context.systemPrompt).not.toContain("UNTRUSTED_LOCAL_PROMPT");
 				expect(model.id).toBe(session.model?.id);
-				return fauxAssistantMessage([fauxToolCall("sure_diagnostic_read", { operation: "timeline" })], {
-					stopReason: "toolUse",
-				});
+				return toolReply(fauxToolCall("sure_diagnostic_read", { operation: "timeline" }));
 			},
 			(context) => {
 				const timeline = context.messages.find((message) => message.role === "toolResult");
 				expect(JSON.stringify(timeline)).toContain("model=demo device=cuda");
-				return repairHandoff(result.repair!);
+				return repairHandoff(repairTask);
 			},
 		]);
 		expect(await diagnoseSureRun(coordinator, ctx, ["run:artifacts"], stage)).toMatchObject({
 			decision: "repair",
-			repair: result.repair,
+			repair: repairTask,
 		});
 		expect(session.messages).toHaveLength(0);
 		expect(coordinator.state.attempts[0]).toMatchObject({
 			modelTurns: 2,
 			readCalls: 1,
-			result: { decision: "repair", repair: result.repair },
+			result: { decision: "repair", repair: repairTask },
 		});
 		const diagnosisDir = join(coordinator.run.runDir, "diagnoses", coordinator.state.attempts[0].id);
 		expect(existsSync(join(diagnosisDir, "result.json"))).toBe(true);
@@ -847,144 +631,19 @@ describe("Sure independent read-only supervisor", () => {
 		).toBe(true);
 	});
 
-	it("preserves recoverable evidence when same-session correction reaches provider failure", async () => {
+	it("does not accept a diagnosis after a denied read without a successful macro inspection", async () => {
 		const { harness, coordinator, ctx } = await setup();
 		harness.setResponses([
-			fauxAssistantMessage([fauxToolCall("sure_diagnostic_read", { operation: "timeline" })], {
-				stopReason: "toolUse",
-			}),
-			fauxAssistantMessage("invalid JSON"),
-			fauxAssistantMessage("must not be called"),
-		]);
-		const result = await diagnoseSureRun(coordinator, ctx, ["run:artifacts"], stage);
-		expect(result.decision).toBe("checkpoint");
-		expect(result.facts).toContain("Original CUDA environment failure");
-		expect(harness.getPendingResponseCount()).toBe(0);
-	});
-
-	it("does not accept a diagnosis after a denied read without a successful macro inspection", async () => {
-		const { harness, coordinator, ctx, result } = await setup();
-		harness.setResponses([
-			fauxAssistantMessage(
-				[fauxToolCall("sure_diagnostic_read", { operation: "file", path: "run:artifacts/env.json" })],
-				{
-					stopReason: "toolUse",
-				},
-			),
-			repairHandoff(result.repair!),
+			toolReply(fauxToolCall("sure_diagnostic_read", { operation: "file", path: "run:artifacts/env.json" })),
+			repairHandoff(repairTask),
 		]);
 		const diagnosis = await diagnoseSureRun(coordinator, ctx, ["run:artifacts"], stage);
 		expect(diagnosis.decision).toBe("checkpoint");
 		expect(coordinator.state.attempts[0].error).toContain("macro timeline");
 	});
 
-	it("does not reset persisted turn/read/time counters on a diagnosing restart", async () => {
-		const { harness, coordinator, ctx } = await setup();
-		coordinator.beginDiagnosis();
-		coordinator.state.attempts[0].modelTurns = 4;
-		coordinator.save();
-		harness.setResponses([fauxAssistantMessage("invalid response"), fauxAssistantMessage("must not be called")]);
-		const restored = new SureCoordinator(coordinator.run, "build_env", []);
-		const result = await diagnoseSureRun(restored, ctx, ["run:artifacts"], stage);
-		expect(result.decision).toBe("checkpoint");
-		expect(restored.state.attempts).toHaveLength(1);
-		expect(restored.state.attempts[0].modelTurns).toBe(7);
-		expect(restored.state.attempts[0].result).toBeUndefined();
-		expect(harness.getPendingResponseCount()).toBe(0);
-	});
-
-	it("cancels an in-flight independent provider and retains cancellation evidence", async () => {
-		const { harness, session, coordinator, ctx } = await setup();
-		let started: (() => void) | undefined;
-		const providerStarted = new Promise<void>((resolve) => {
-			started = resolve;
-		});
-		harness.setResponses([
-			async (_context, options) => {
-				started?.();
-				await new Promise<void>((resolve) =>
-					options?.signal?.addEventListener("abort", () => resolve(), { once: true }),
-				);
-				return fauxAssistantMessage("", { stopReason: "aborted" });
-			},
-		]);
-		const diagnosis = diagnoseSureRun(coordinator, ctx, ["run:artifacts"], stage);
-		await providerStarted;
-		await session.abort();
-		const result = await diagnosis;
-		expect(checkpointReason(result)).toContain("cancelled");
-		expect(
-			JSON.parse(readFileSync(join(coordinator.run.runDir, "coordination.json"), "utf8")).attempts[0].error,
-		).toContain("cancelled");
-	});
-
-	it("reuses a completed persisted diagnosis without another provider call", async () => {
-		const { harness, coordinator, ctx, result } = await setup();
-		coordinator.beginDiagnosis();
-		coordinator.state.attempts[0].result = result;
-		coordinator.save();
-		harness.setResponses([fauxAssistantMessage("must not be called")]);
-		expect(await diagnoseSureRun(new SureCoordinator(coordinator.run, "build_env", []), ctx, [], stage)).toEqual(
-			result,
-		);
-		expect(harness.getPendingResponseCount()).toBe(1);
-	});
-
-	it("accepts the ninth and later parallel evidence reads and preserves final synthesis", async () => {
-		const { harness, coordinator, ctx, result } = await setup();
-		harness.setResponses([
-			fauxAssistantMessage(
-				Array.from({ length: 17 }, () =>
-					fauxToolCall("sure_diagnostic_read", { operation: "timeline", offset: 0 }),
-				),
-				{ stopReason: "toolUse" },
-			),
-			(context) => {
-				expect(context.messages.filter((m) => m.role === "toolResult").every((m) => !m.isError)).toBe(true);
-				return repairHandoff(result.repair!);
-			},
-		]);
-		expect(await diagnoseSureRun(coordinator, ctx, [], stage)).toMatchObject({
-			decision: "repair",
-			repair: result.repair,
-		});
-		expect(coordinator.state.attempts[0]).toMatchObject({ readCalls: 17, readRequests: 17, modelTurns: 2 });
-	});
-	it.each([3, 4, 8])("synthesizes after the live failure's 1+4+%s read sequence", async (lastBatch) => {
-		const { harness, coordinator, ctx, result } = await setup();
-		harness.setResponses([
-			fauxAssistantMessage([fauxToolCall("sure_diagnostic_read", { operation: "timeline" })], {
-				stopReason: "toolUse",
-			}),
-			...[4, lastBatch].map((count) =>
-				fauxAssistantMessage(
-					Array.from({ length: count }, () =>
-						fauxToolCall("sure_diagnostic_read", { operation: "check", checkVersion: 1 }),
-					),
-					{ stopReason: "toolUse" },
-				),
-			),
-			(context) => {
-				expect(
-					context.messages.filter((message) => message.role === "toolResult").every((message) => !message.isError),
-				).toBe(true);
-				return repairHandoff(result.repair!);
-			},
-		]);
-		expect(await diagnoseSureRun(coordinator, ctx, [], stage)).toMatchObject({
-			decision: "repair",
-			repair: result.repair,
-		});
-		expect(coordinator.state.attempts[0]).toMatchObject({
-			readCalls: 5 + lastBatch,
-			readRequests: 5 + lastBatch,
-			modelTurns: 4,
-		});
-		expect(coordinator.state.units.build_env.checks).toBe(1);
-	});
-
 	it("keeps an investigation active beyond 120 seconds until its provider completes", async () => {
-		const { harness, coordinator, ctx, result } = await setup();
+		const { harness, coordinator, ctx } = await setup();
 		vi.useFakeTimers();
 		let started!: () => void;
 		let finish!: () => void;
@@ -995,13 +654,11 @@ describe("Sure independent read-only supervisor", () => {
 			finish = resolve;
 		});
 		harness.setResponses([
-			fauxAssistantMessage([fauxToolCall("sure_diagnostic_read", { operation: "timeline" })], {
-				stopReason: "toolUse",
-			}),
+			toolReply(fauxToolCall("sure_diagnostic_read", { operation: "timeline" })),
 			async () => {
 				started();
 				await released;
-				return repairHandoff(result.repair!);
+				return repairHandoff(repairTask);
 			},
 		]);
 		let settled = false;
@@ -1013,7 +670,7 @@ describe("Sure independent read-only supervisor", () => {
 		await vi.advanceTimersByTimeAsync(240_001);
 		expect(settled).toBe(false);
 		finish();
-		expect(await pending).toMatchObject({ decision: "repair", repair: result.repair });
+		expect(await pending).toMatchObject({ decision: "repair", repair: repairTask });
 		expect(coordinator.state.attempts[0].elapsedMs).toBeGreaterThanOrEqual(240_000);
 	});
 

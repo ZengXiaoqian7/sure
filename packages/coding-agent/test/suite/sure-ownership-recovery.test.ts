@@ -1,36 +1,36 @@
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { acquireSureRunOwnership } from "../../src/core/sure/ownership.ts";
-import { createHarness, type Harness } from "./harness.ts";
 
-const harnesses: Harness[] = [];
+const directories: string[] = [];
 const moduleUrl = pathToFileURL(resolve(import.meta.dirname, "../../src/core/sure/ownership.ts")).href;
 
 afterEach(() => {
-	for (const harness of harnesses.splice(0)) harness.cleanup();
+	for (const dir of directories.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-async function fixture() {
-	const harness = await createHarness();
-	harnesses.push(harness);
-	const path = join(harness.tempDir, ".coordination-owner.json");
-	return { harness, path, reclaim: `${path}.reclaim` };
+function fixture() {
+	const tempDir = mkdtempSync(join(tmpdir(), "sure-ownership-"));
+	directories.push(tempDir);
+	const path = join(tempDir, ".coordination-owner.json");
+	return { tempDir, path, reclaim: `${path}.reclaim` };
 }
 
 describe("SURE process ownership recovery", () => {
 	it.each(["reclaim", "removed", "published"])("recovers a real exited reclaimer at %s", async (point) => {
-		const { harness, path, reclaim } = await fixture();
-		const helper = join(harness.tempDir, "crash.mjs");
+		const { tempDir, path, reclaim } = fixture();
+		const helper = join(tempDir, "crash.mjs");
 		writeFileSync(
 			helper,
 			`
 import { readFileSync, writeFileSync, unlinkSync } from "node:fs";
 import { acquireSureRunOwnership } from ${JSON.stringify(moduleUrl)};
-const owner = acquireSureRunOwnership(${JSON.stringify(harness.tempDir)});
+const owner = acquireSureRunOwnership(${JSON.stringify(tempDir)});
 const next = readFileSync(${JSON.stringify(path)}, "utf8");
 const old = JSON.stringify({...JSON.parse(next), processIdentity:"previous-process"});
 writeFileSync(${JSON.stringify(path)}, old);
@@ -42,18 +42,18 @@ process.exit(0);
 		);
 		const child = spawnSync(process.execPath, [helper], { encoding: "utf8", timeout: 10_000 });
 		expect(child.status, child.stderr).toBe(0);
-		const replacement = acquireSureRunOwnership(harness.tempDir);
+		const replacement = acquireSureRunOwnership(tempDir);
 		replacement.assertCurrent();
 		expect(existsSync(reclaim)).toBe(false);
 		replacement.release();
 	});
 
 	it("distinguishes a reused live PID and rejects the old instance after replacement", async () => {
-		const { harness, path } = await fixture();
-		const old = acquireSureRunOwnership(harness.tempDir);
+		const { tempDir, path } = fixture();
+		const old = acquireSureRunOwnership(tempDir);
 		const record = JSON.parse(readFileSync(path, "utf8"));
 		writeFileSync(path, JSON.stringify({ ...record, processIdentity: "different-process-start" }));
-		const current = acquireSureRunOwnership(harness.tempDir);
+		const current = acquireSureRunOwnership(tempDir);
 		expect(() => old.assertCurrent()).toThrow("stale");
 		old.release();
 		current.assertCurrent();
@@ -61,43 +61,43 @@ process.exit(0);
 	});
 
 	it("preserves live reclaimers, ambiguous markers and replaced owners with concrete recovery paths", async () => {
-		const { harness, path, reclaim } = await fixture();
-		const live = acquireSureRunOwnership(harness.tempDir);
+		const { tempDir, path, reclaim } = fixture();
+		const live = acquireSureRunOwnership(tempDir);
 		const text = readFileSync(path, "utf8");
 		const owner = JSON.parse(text);
 		writeFileSync(reclaim, JSON.stringify({ owner, previousOwner: text }));
-		expect(() => acquireSureRunOwnership(harness.tempDir)).toThrow("already active");
+		expect(() => acquireSureRunOwnership(tempDir)).toThrow("already active");
 		writeFileSync(reclaim, "");
-		expect(() => acquireSureRunOwnership(harness.tempDir)).toThrow(reclaim);
+		expect(() => acquireSureRunOwnership(tempDir)).toThrow(reclaim);
 		expect(readFileSync(path, "utf8")).toBe(text);
 		writeFileSync(
 			reclaim,
 			JSON.stringify({ owner: { ...owner, processIdentity: "exited" }, previousOwner: "old owner" }),
 		);
-		expect(() => acquireSureRunOwnership(harness.tempDir)).toThrow("owner changed");
+		expect(() => acquireSureRunOwnership(tempDir)).toThrow("owner changed");
 		expect(readFileSync(path, "utf8")).toBe(text);
 		rmSync(reclaim);
 		live.release();
 		writeFileSync(path, JSON.stringify({ ...owner, processIdentity: undefined }));
-		expect(() => acquireSureRunOwnership(harness.tempDir)).toThrow("no verifiable recorded start identity");
+		expect(() => acquireSureRunOwnership(tempDir)).toThrow("no verifiable recorded start identity");
 		writeFileSync(path, "");
-		expect(() => acquireSureRunOwnership(harness.tempDir)).toThrow("cannot be safely recovered");
+		expect(() => acquireSureRunOwnership(tempDir)).toThrow("cannot be safely recovered");
 	});
 
 	it("serializes two processes recovering the same dead marker without removing the winner", async () => {
-		const { harness, path, reclaim } = await fixture();
-		const original = acquireSureRunOwnership(harness.tempDir);
+		const { tempDir, path, reclaim } = fixture();
+		const original = acquireSureRunOwnership(tempDir);
 		const dead = { ...JSON.parse(readFileSync(path, "utf8")), processIdentity: "previous-process" };
 		const text = JSON.stringify(dead);
 		writeFileSync(path, text);
 		writeFileSync(reclaim, JSON.stringify({ owner: dead, previousOwner: text }));
-		const helper = join(harness.tempDir, "competing.mjs");
+		const helper = join(tempDir, "competing.mjs");
 		writeFileSync(
 			helper,
 			`
 import { acquireSureRunOwnership } from ${JSON.stringify(moduleUrl)};
 try {
-  acquireSureRunOwnership(${JSON.stringify(harness.tempDir)});
+  acquireSureRunOwnership(${JSON.stringify(tempDir)});
   process.stdout.write("ready");
   setInterval(() => {}, 1000);
 } catch { process.stdout.write("blocked"); }
@@ -127,17 +127,17 @@ try {
 			for (const { child } of children) child.kill("SIGKILL");
 			await Promise.all(children.map(({ exited }) => exited));
 		}
-		acquireSureRunOwnership(harness.tempDir).release();
+		acquireSureRunOwnership(tempDir).release();
 	});
 
 	it("excludes a second real process, then recovers after its exit", async () => {
-		const { harness } = await fixture();
-		const helper = join(harness.tempDir, "owner.mjs");
+		const { tempDir } = fixture();
+		const helper = join(tempDir, "owner.mjs");
 		writeFileSync(
 			helper,
 			`
 import { acquireSureRunOwnership } from ${JSON.stringify(moduleUrl)};
-acquireSureRunOwnership(${JSON.stringify(harness.tempDir)});
+acquireSureRunOwnership(${JSON.stringify(tempDir)});
 process.stdout.write("ready");
 setInterval(() => {}, 1000);
 `,
@@ -155,12 +155,12 @@ setInterval(() => {}, 1000);
 					throw new Error(`Owner process exited before readiness: ${stderr}`);
 				}),
 			]);
-			expect(() => acquireSureRunOwnership(harness.tempDir)).toThrow("already active");
+			expect(() => acquireSureRunOwnership(tempDir)).toThrow("already active");
 		} finally {
 			child.kill("SIGKILL");
 			await exited;
 		}
-		const replacement = acquireSureRunOwnership(harness.tempDir);
+		const replacement = acquireSureRunOwnership(tempDir);
 		replacement.assertCurrent();
 		replacement.release();
 	});

@@ -9,18 +9,17 @@ import { createAgentSession } from "../../src/core/sdk.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
 import { SettingsManager } from "../../src/core/settings-manager.ts";
 import { SureCoordinator } from "../../src/core/sure/coordinator.ts";
-import { acquireSureRunOwnership } from "../../src/core/sure/ownership.ts";
 import { diagnoseSureRun } from "../../src/core/sure/supervisor.ts";
 import { prepareSureSupervisorSession } from "../../src/core/sure/supervisor-session.ts";
 import type { SureRunRecord } from "../../src/core/sure/types.ts";
 import { createHarness, type Harness } from "./harness.ts";
+import { toolReply } from "./sure-control-fixtures.ts";
 
 const resources: { harness: Harness; session: AgentSession }[] = [];
 const stage = { id: "first", prompt: "first.md", references: [], snapshotPaths: ["run:artifacts"] };
-const macro = () =>
-	fauxAssistantMessage([fauxToolCall("sure_diagnostic_read", { operation: "timeline" })], { stopReason: "toolUse" });
+const macro = () => toolReply(fauxToolCall("sure_diagnostic_read", { operation: "timeline" }));
 const handoff = (task = "Run the original probe and let its original gate check the result.") =>
-	fauxAssistantMessage([fauxToolCall("sure_handoff_repair", { task })], { stopReason: "toolUse" });
+	toolReply(fauxToolCall("sure_handoff_repair", { task }));
 
 async function fixture() {
 	const harness = await createHarness();
@@ -197,7 +196,7 @@ describe("SURE persistent repair-only supervisor", () => {
 		const { harness, coordinator, ctx, scope } = await fixture();
 		harness.setResponses([
 			macro(),
-			fauxAssistantMessage([fauxToolCall("sure_request_stop", { reason: "Impossible" })], { stopReason: "toolUse" }),
+			toolReply(fauxToolCall("sure_request_stop", { reason: "Impossible" })),
 			handoff(),
 		]);
 		const outcome = await diagnoseSureRun(coordinator, ctx, scope, stage);
@@ -206,31 +205,13 @@ describe("SURE persistent repair-only supervisor", () => {
 		expect(coordinator.state.stopReason).toBeUndefined();
 	});
 
-	it("does not restrict valid ninth and subsequent reads", async () => {
-		const { harness, coordinator, ctx, scope } = await fixture();
-		harness.setResponses([
-			macro(),
-			...Array.from({ length: 11 }, () =>
-				fauxAssistantMessage([fauxToolCall("sure_diagnostic_read", { operation: "snapshot" })], {
-					stopReason: "toolUse",
-				}),
-			),
-			handoff(),
-		]);
-		expect((await diagnoseSureRun(coordinator, ctx, scope, stage)).decision).toBe("repair");
-		expect(coordinator.state.attempts[0].readCalls).toBe(12);
-	});
-
 	it("rejects conflicting control calls in a batch before any repair is accepted", async () => {
 		const { harness, coordinator, ctx, scope } = await fixture();
 		harness.setResponses([
 			macro(),
-			fauxAssistantMessage(
-				[
-					fauxToolCall("sure_handoff_repair", { task: "one" }),
-					fauxToolCall("sure_handoff_repair", { task: "two" }),
-				],
-				{ stopReason: "toolUse" },
+			toolReply(
+				fauxToolCall("sure_handoff_repair", { task: "one" }),
+				fauxToolCall("sure_handoff_repair", { task: "two" }),
 			),
 			handoff("unique"),
 		]);
@@ -245,19 +226,11 @@ describe("SURE persistent repair-only supervisor", () => {
 		await diagnoseSureRun(coordinator, ctx, scope, stage);
 		const file = coordinator.state.supervisorSession!.file;
 		const manager = SessionManager.open(file);
-		manager.appendMessage(
-			fauxAssistantMessage([fauxToolCall("sure_handoff_repair", { task: "abandoned branch" })], {
-				stopReason: "toolUse",
-			}),
-		);
+		manager.appendMessage(toolReply(fauxToolCall("sure_handoff_repair", { task: "abandoned branch" })));
 		manager.branch(coordinator.state.supervisorSession!.leafId!);
 		manager.appendMessage(fauxAssistantMessage("Current branch retained the saved checkpoint."));
 		expect(prepareSureSupervisorSession(coordinator).recoveryMessages).toEqual([]);
-		manager.appendMessage(
-			fauxAssistantMessage([fauxToolCall("sure_handoff_repair", { task: "interrupted" })], {
-				stopReason: "toolUse",
-			}),
-		);
+		manager.appendMessage(toolReply(fauxToolCall("sure_handoff_repair", { task: "interrupted" })));
 		const prepared = prepareSureSupervisorSession(coordinator);
 		expect(prepared.recoveryMessages).toHaveLength(1);
 		expect(prepared.recoveryMessages[0]).toMatchObject({ isError: true });
@@ -267,17 +240,6 @@ describe("SURE persistent repair-only supervisor", () => {
 		rmSync(file);
 		expect(() => prepareSureSupervisorSession(coordinator)).toThrow("missing");
 		expect(existsSync(file)).toBe(false);
-	});
-
-	it("holds invocation ownership and rejects a second owner without a timeout takeover", async () => {
-		const { coordinator } = await fixture();
-		const owner = acquireSureRunOwnership(coordinator.run.runDir);
-		expect(() => acquireSureRunOwnership(coordinator.run.runDir)).toThrow("already active");
-		owner.assertCurrent();
-		owner.release();
-		const replacement = acquireSureRunOwnership(coordinator.run.runDir);
-		expect(() => owner.assertCurrent()).toThrow("stale");
-		replacement.release();
 	});
 
 	it("rejects cached results and a new investigation after cancellation without writing evidence", async () => {

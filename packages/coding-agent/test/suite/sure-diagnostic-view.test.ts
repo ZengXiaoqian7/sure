@@ -1,4 +1,5 @@
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, it } from "vitest";
 import { SureCoordinator } from "../../src/core/sure/coordinator.ts";
@@ -12,9 +13,8 @@ import {
 } from "../../src/core/sure/diagnostic-view.ts";
 import { captureSureSnapshot, diffSureSnapshots, writeSureJson } from "../../src/core/sure/evidence.ts";
 import type { SureRunRecord } from "../../src/core/sure/types.ts";
-import { createHarness, type Harness } from "./harness.ts";
 
-const harnesses: Harness[] = [];
+const directories: string[] = [];
 it.each([
 	{ name: "Unicode lines", text: "行🌍\n".repeat(5001) },
 	{ name: "single long line", text: "中🌍".repeat(50_000) },
@@ -35,19 +35,19 @@ it.each([
 	expect(assembled).toBe(text);
 });
 afterEach(() => {
-	for (const harness of harnesses.splice(0)) harness.cleanup();
+	for (const dir of directories.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
-async function setup() {
-	const harness = await createHarness();
-	harnesses.push(harness);
+function setup() {
+	const tempDir = mkdtempSync(join(tmpdir(), "sure-diagnostic-"));
+	directories.push(tempDir);
 	const run: SureRunRecord = {
 		runId: "index-test",
 		skillName: "demo",
 		command: "sure_feed",
 		status: "running",
-		cwd: harness.tempDir,
-		packageDir: harness.tempDir,
-		runDir: join(harness.tempDir, ".sure/runs/index-test"),
+		cwd: tempDir,
+		packageDir: tempDir,
+		runDir: join(tempDir, ".sure/runs/index-test"),
 		args: "",
 		startedAt: "now",
 		updatedAt: "now",
@@ -55,8 +55,8 @@ async function setup() {
 	mkdirSync(join(run.runDir, "artifacts"), { recursive: true });
 	return new SureCoordinator(run, "stage", ["run:artifacts"]);
 }
-it("indexes every stage and check beyond the former 1024-record cutoff", async () => {
-	const coordinator = await setup();
+it("indexes every stage and check beyond the former 1024-record cutoff", () => {
+	const coordinator = setup();
 	const evidence = join(coordinator.run.runDir, "evidence");
 	mkdirSync(evidence, { recursive: true });
 	for (let version = 1; version <= 1100; version++)
@@ -110,8 +110,8 @@ it("round-trips every compact diff identity while preserving unknown capture sta
 	expect(JSON.stringify(packed).length).toBeLessThan(JSON.stringify(entries).length);
 });
 
-it("bisects whole batches and permits returning to either side without discarding cross-links", async () => {
-	const coordinator = await setup();
+it("bisects whole batches and permits returning to either side without discarding cross-links", () => {
+	const coordinator = setup();
 	for (let index = 0; index < 6; index++)
 		writeSureJson(join(coordinator.run.runDir, `evidence/tools/call-${index}.json`), {
 			toolCallId: `call-${index}`,
@@ -138,8 +138,8 @@ it("bisects whole batches and permits returning to either side without discardin
 	expect(() => sureDiagnosticRange(index, "batch-2", "batch-0")).toThrow();
 });
 
-it("pages a large historical diff and focuses on an indexed path without losing its middle", async () => {
-	const coordinator = await setup(),
+it("pages a large historical diff and focuses on an indexed path without losing its middle", () => {
+	const coordinator = setup(),
 		run = coordinator.run;
 	const path = join(run.runDir, "artifacts/code.py");
 	writeFileSync(path, `${"old line\n".repeat(1800)}OLD_MIDDLE\n${"old line\n".repeat(1800)}`);
@@ -165,8 +165,8 @@ it("pages a large historical diff and focuses on an indexed path without losing 
 	expect(assembled).not.toContain("other.py");
 });
 
-it("indexes only actual passed outputs and keeps their historical meaning after deletion or missing capture", async () => {
-	const coordinator = await setup();
+it("indexes only actual passed outputs and keeps their historical meaning after deletion or missing capture", () => {
+	const coordinator = setup();
 	const path = "run:artifacts/research.json";
 	writeFileSync(join(coordinator.run.runDir, "artifacts/research.json"), "research");
 	for (const [unitId, outcome] of [

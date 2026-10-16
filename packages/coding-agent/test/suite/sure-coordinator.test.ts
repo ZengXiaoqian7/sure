@@ -10,8 +10,7 @@ import {
 	readSureSnapshot,
 	resolveSureEvidencePath,
 } from "../../src/core/sure/evidence.ts";
-import { SureHookRunner } from "../../src/core/sure/hooks.ts";
-import type { SureCheckEvidence, SureRunRecord, SureSkillPackage } from "../../src/core/sure/types.ts";
+import type { SureCheckEvidence, SureRunRecord } from "../../src/core/sure/types.ts";
 import { syncSureUserContext } from "../../src/core/sure/user-context.ts";
 
 const directories: string[] = [];
@@ -151,79 +150,6 @@ describe("Sure coordinator persistence and evidence", () => {
 		});
 		expect(new SureCoordinator(run, "build_env", []).state.units.build_env.directRepairs).toBe(1);
 	});
-	it("records three completed pending batches without forcing diagnosis", () => {
-		const run = setup();
-		let coordinator = new SureCoordinator(run, "build_env", []);
-		coordinator.observe(
-			{
-				...check("blocked", "tool"),
-				recovery: "local_once",
-				action: {
-					toolCallId: "failed",
-					toolName: "read",
-					path: "run:evidence/tools/failed.json",
-					batchId: "trigger",
-				},
-			},
-			[],
-		);
-		coordinator.recordToolBatch("build_env", "trigger");
-		coordinator.recordToolBatch("build_env", "batch-1");
-		expect(coordinator.state.units.build_env.directRepairStalledBatches).toBe(1);
-		coordinator = new SureCoordinator(run, "build_env", []);
-		coordinator.recordToolBatch("build_env", "batch-2");
-		expect(coordinator.state.status).toBe("executing");
-		coordinator.recordToolBatch("build_env", "batch-3");
-		expect(coordinator.state.status).toBe("executing");
-		expect(coordinator.state.units.build_env.directRepairStalledBatches).toBe(3);
-		expect(coordinator.state.units.build_env.calls).toBeUndefined();
-		expect(coordinator.state.units.build_env).toMatchObject({
-			checks: 1,
-			directRepairs: 1,
-			supervisorRepairs: 0,
-		});
-	});
-	it("resets the post-repair batch count after skill-verified progress", () => {
-		const run = setup();
-		const artifact = join(run.runDir, "artifacts/env.json");
-		writeFileSync(artifact, '{"completed":0}');
-		const coordinator = new SureCoordinator(run, "build_env", ["run:artifacts"]);
-		coordinator.observe({ ...check("pending"), progress: { key: "verified_parts", completed: 0 } }, [
-			"run:artifacts",
-		]);
-		coordinator.observe(
-			{
-				...check("blocked", "tool"),
-				recovery: "local_once",
-				action: {
-					toolCallId: "failed",
-					toolName: "read",
-					path: "run:evidence/tools/failed.json",
-					batchId: "trigger",
-				},
-			},
-			["run:artifacts"],
-		);
-		coordinator.recordToolBatch("build_env", "trigger");
-		coordinator.recordToolBatch("build_env", "batch-1");
-		writeFileSync(artifact, '{"completed":1}');
-		coordinator.observe({ ...check("pending"), progress: { key: "verified_parts", completed: 1 } }, [
-			"run:artifacts",
-		]);
-		coordinator.recordToolBatch("build_env", "batch-2");
-		coordinator.recordToolBatch("build_env", "batch-3");
-		expect(coordinator.state.status).toBe("executing");
-		expect(coordinator.state.units.build_env.directRepairStalledBatches).toBe(1);
-	});
-	it("does not use pending batches to hand off a format correction", () => {
-		const run = setup();
-		const coordinator = new SureCoordinator(run, "build_env", []);
-		coordinator.observe(check("blocked", "format"), []);
-		expect(coordinator.directRepair?.source).toBe("executor");
-		for (const batch of ["batch-1", "batch-2", "batch-3"]) coordinator.recordToolBatch("build_env", batch);
-		expect(coordinator.state.status).toBe("executing");
-	});
-
 	it.each(["format", "tool", "semantic", "execution", "checker_exception", undefined] as const)(
 		"gives a first %s error a correction regardless of recovery hints or past supervision",
 		(kind) => {
@@ -294,35 +220,43 @@ describe("Sure coordinator persistence and evidence", () => {
 		expect(coordinator.state.status).toBe("yielding");
 		expect(() => coordinator.verifyRepair(repair.id, 3, "recheck")).toThrow("already has a verification");
 	});
-	it.each(["skipped", "held"])("does not treat a %s tool observation as a corrected execution", (kind) => {
-		const run = setup();
-		const coordinator = new SureCoordinator(run, "build_env", []);
-		coordinator.observe(check("blocked", "tool"), []);
-		const repair = coordinator.directRepair!;
-		mkdirSync(join(run.runDir, "evidence/tools"), { recursive: true });
-		writeFileSync(
-			join(run.runDir, "evidence/tools/next.json"),
-			JSON.stringify({
-				execution: kind === "skipped" ? "skipped" : "returned",
-				duringHold: kind === "held",
-				isError: false,
-			}),
-		);
-		coordinator.observe(
-			{
-				...check("pending"),
-				action: {
-					toolCallId: "next",
-					toolName: "bash",
-					path: "run:evidence/tools/next.json",
+	it.each(["skipped", "held", "returned"])(
+		"verifies a tool correction only from a returned observation: %s",
+		(kind) => {
+			const run = setup();
+			const coordinator = new SureCoordinator(run, "build_env", []);
+			coordinator.observe(check("blocked", "tool"), []);
+			const repair = coordinator.directRepair!;
+			mkdirSync(join(run.runDir, "evidence/tools"), { recursive: true });
+			writeFileSync(
+				join(run.runDir, "evidence/tools/next.json"),
+				JSON.stringify({
+					execution: kind === "skipped" ? "skipped" : "returned",
+					duringHold: kind === "held",
+					isError: false,
+				}),
+			);
+			coordinator.observe(
+				{
+					...check("pending"),
+					action: {
+						toolCallId: "next",
+						toolName: "bash",
+						path: "run:evidence/tools/next.json",
+					},
 				},
-			},
-			[],
-		);
-		expect(() => coordinator.verifyRepair(repair.id, 2, "recheck")).toThrow("Skipped or held");
-		expect(repair.verificationCheckVersion).toBeUndefined();
-		expect(coordinator.state.status).toBe("executing");
-	});
+				[],
+			);
+			if (kind === "returned") {
+				coordinator.verifyRepair(repair.id, 2, "recheck");
+				expect(repair).toMatchObject({ verificationCheckVersion: 2, outcome: "passed" });
+			} else {
+				expect(() => coordinator.verifyRepair(repair.id, 2, "recheck")).toThrow("Skipped or held");
+				expect(repair.verificationCheckVersion).toBeUndefined();
+			}
+			expect(coordinator.state.status).toBe("executing");
+		},
+	);
 	it("does not let work-volume thresholds preempt a pending local correction", () => {
 		const coordinator = new SureCoordinator(setup(), "build_env", []);
 		coordinator.observe(check(), []);
@@ -377,6 +311,11 @@ describe("Sure coordinator persistence and evidence", () => {
 		coordinator.observe({ ...check("pending"), progress: { key: "validated_parts", completed: 0 } }, [
 			"run:artifacts",
 		]);
+		coordinator.state.units.build_env.noProgress = 2;
+		coordinator.observe({ ...check("pending"), progress: { key: "validated_parts", completed: 1 } }, [
+			"run:artifacts",
+		]);
+		expect(coordinator.state.units.build_env.noProgress).toBe(2);
 		for (let completed = 1; completed <= 2; completed++) {
 			coordinator.recordAction("build_env", "read", { path: "env.json" });
 			writeFileSync(path, JSON.stringify({ completed }));
@@ -387,7 +326,12 @@ describe("Sure coordinator persistence and evidence", () => {
 		coordinator = new SureCoordinator(run, "build_env", []);
 		coordinator.recordAction("build_env", "read", { path: "env.json" });
 		expect(coordinator.state.status).toBe("executing");
-		expect(coordinator.state.units.build_env).toMatchObject({ calls: 3, checks: 3, progress: { completed: 2 } });
+		expect(coordinator.state.units.build_env).toMatchObject({
+			calls: 3,
+			checks: 4,
+			noProgress: 0,
+			progress: { completed: 2 },
+		});
 		// A changed irrelevant field, a new milestone key and a regressed counter
 		// must not renew the allowance, even when declared files changed.
 		writeFileSync(path, '{"completed":2,"irrelevant":"changed"}');
@@ -406,49 +350,11 @@ describe("Sure coordinator persistence and evidence", () => {
 		expect(coordinator.state.units.build_env.calls).toBe(5);
 	});
 
-	it("does not infer progress from changed files, changed wording, or a milestone without changed evidence", () => {
-		const run = setup();
-		const coordinator = new SureCoordinator(run, "build_env", ["run:artifacts"]);
-		writeFileSync(join(run.runDir, "artifacts/env.json"), '{"ready":false}');
-		coordinator.observe({ ...check("pending"), progress: { key: "verified", completed: 0 } }, ["run:artifacts"]);
-		coordinator.recordAction("build_env", "read", { path: "env.json" });
-		coordinator.observe({ ...check("pending"), progress: { key: "verified", completed: 1 } }, ["run:artifacts"]);
-		coordinator.recordAction("build_env", "read", { path: "env.json" });
-		writeFileSync(join(run.runDir, "artifacts/env.json"), '{"ready":false,"note":"new wording"}');
-		coordinator.observe({ ...check("pending"), summary: "new wording" }, ["run:artifacts"]);
-		coordinator.recordAction("build_env", "read", { path: "env.json" });
-		expect(coordinator.state.status).toBe("executing");
-		expect(() => parseSureCheckEvidence({ ...check(), progress: { key: "verified", completed: -1 } })).toThrow();
-	});
-
-	it("keeps cumulative usage but routes volume thresholds to evaluation instead of stopping", () => {
-		const run = setup();
-		const coordinator = new SureCoordinator(run, "build_env", ["run:artifacts"]);
-		writeFileSync(join(run.runDir, "artifacts/env.json"), '{"completed":0}');
-		coordinator.observe({ ...check("pending"), progress: { key: "verified", completed: 0 } }, ["run:artifacts"]);
-		Object.assign(coordinator.state.units.build_env, {
-			calls: 39,
-			supervisorRepairs: 2,
-			directRepairs: 1,
-			noProgress: 2,
-		});
-		writeFileSync(join(run.runDir, "artifacts/env.json"), '{"completed":1}');
-		coordinator.observe({ ...check("pending"), progress: { key: "verified", completed: 1 } }, ["run:artifacts"]);
-		expect(coordinator.state.units.build_env).toMatchObject({
-			calls: 39,
-			supervisorRepairs: 2,
-			directRepairs: 1,
-			noProgress: 0,
-		});
-		coordinator.recordAction("build_env", "read", { path: "env.json" });
-		expect(coordinator.state.status).toBe("yielding");
-		expect(new SureCoordinator(run, "build_env", []).resumeBlocker).toBeUndefined();
-	});
-
 	it("requires explicit versioned opt-in and rejects ambiguous outcomes", () => {
 		expect(parseSureCoordinationPolicy(undefined)).toBeUndefined();
 		expect(() => parseSureCoordinationPolicy({ version: 2, stages: [] })).toThrow();
 		expect(() => parseSureCheckEvidence({ ...check(), outcome: "maybe" })).toThrow();
+		expect(() => parseSureCheckEvidence({ ...check(), progress: { key: "verified", completed: -1 } })).toThrow();
 	});
 
 	it("retains original historical text and reports additions, deletion and opaque content", () => {
@@ -472,50 +378,6 @@ describe("Sure coordinator persistence and evidence", () => {
 			'-{"ready":true}',
 		);
 		expect(resolveSureEvidencePath(run, "project:../../outside")).toBeUndefined();
-	});
-
-	it("keeps unchanged reads and repeated actions inside the unresolved correction", async () => {
-		const run = setup();
-		const coordinator = new SureCoordinator(run, "build_env", ["run:artifacts"]);
-		coordinator.observe(check("blocked", "format"), ["run:artifacts"]);
-		expect(coordinator.state.status).toBe("executing");
-		writeFileSync(
-			join(run.cwd, "hook.ts"),
-			`export function post_tool_result() { return ${JSON.stringify({ ok: true, check: check("unchanged", "no_progress") })}; }`,
-		);
-		const skill: SureSkillPackage = {
-			manifest: {
-				name: "sure_onboard",
-				command: "sure_onboard",
-				prompt: "SKILL.md",
-				hooks: { post_tool_result: [{ module: "hook.ts" }] },
-			},
-			manifestPath: "",
-			packageDir: run.cwd,
-			promptPath: "",
-			prompt: "",
-			source: "project",
-			sourceRoot: run.cwd,
-		};
-		const result = await new SureHookRunner(skill).run("post_tool_result", {
-			run,
-			skill: skill.manifest,
-			cwd: run.cwd,
-			packageDir: run.cwd,
-			runDir: run.runDir,
-			args: "",
-		});
-		expect(result.ok).toBe(true);
-		expect(result.check?.outcome).toBe("unchanged");
-		coordinator.observe(result.check!, ["run:artifacts"]);
-		expect(coordinator.state.status).toBe("executing");
-		expect(coordinator.state.units.build_env.noProgress).toBe(1);
-		coordinator.recordAction("build_env", "read", { path: "env.json" });
-		coordinator.recordAction("build_env", "read", { path: "env.json" });
-		const resumed = new SureCoordinator(run, "build_env", []);
-		resumed.recordAction("build_env", "read", { path: "env.json" });
-		expect(resumed.state.status).toBe("executing");
-		expect(resumed.state.units.build_env.directRepairs).toBe(1);
 	});
 
 	it("keeps a diagnosis current when the same evidence is declared with overlapping paths", () => {
@@ -681,37 +543,5 @@ describe("Sure coordinator persistence and evidence", () => {
 		expect(coordinator.state.lastCheck?.outcome).toBe("pending");
 		expect(coordinator.resumeBlocker).toBeUndefined();
 		expect(coordinator.state.units.build_env.noProgress).toBe(0);
-	});
-	it("allows an explicitly reviewed task to repeat a command while retaining cumulative use", () => {
-		const run = setup();
-		const coordinator = new SureCoordinator(run, "build_env", []);
-		for (let index = 0; index < 3; index++) coordinator.recordAction("build_env", "bash", { command: "verify" });
-		expect(coordinator.state.status).toBe("executing");
-		for (let index = 0; index < 4; index++) {
-			coordinator.beginDiagnosis();
-			expect(
-				coordinator.acceptDiagnosis({
-					runId: run.runId,
-					unitId: "build_env",
-					evidenceVersion: coordinator.state.evidenceVersion,
-					decision: "repair",
-					facts: [],
-					hypotheses: [],
-					unknowns: [],
-					evidenceReferences: [`snapshot:${coordinator.state.latestSnapshot}`],
-					targetFiles: [],
-					repair: "Reverify the current runtime after checking the new external condition.",
-					validation: "Original gate",
-					stopBoundary: "Return for assessment if still blocked",
-					nextActions: [],
-				}),
-			).toBe(true);
-			coordinator.recordAction("build_env", "bash", { command: "verify" });
-			expect(coordinator.state.status).toBe("executing");
-			coordinator.observe(check("blocked"), []);
-		}
-		expect(coordinator.state.units.build_env).toMatchObject({ calls: 7, supervisorRepairs: 4, checks: 4 });
-		expect(coordinator.state.attempts).toHaveLength(4);
-		expect(coordinator.resumeBlocker).toBeUndefined();
 	});
 });

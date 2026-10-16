@@ -23,6 +23,7 @@ import type {
 	AgentState,
 	AgentTool,
 	PrepareNextTurnContext,
+	StreamFn,
 	ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
 import { contentText } from "@earendil-works/pi-ai";
@@ -98,9 +99,10 @@ import { ModelRegistry } from "./model-registry.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
+import type { IsolatedSessionFactory, SessionContextProjection } from "./session-controls.ts";
 import { exportSessionToJsonl } from "./session-export.ts";
 import type { BranchSummaryEntry, CompactionEntry, SessionEntry, SessionManager } from "./session-manager.ts";
-import { getLatestCompactionEntry } from "./session-manager.ts";
+import { buildSessionContext, getLatestCompactionEntry } from "./session-manager.ts";
 import type { SettingsManager } from "./settings-manager.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.ts";
@@ -195,6 +197,7 @@ function withoutDeletedHeaders(headers: ProviderHeaders | undefined): Record<str
 }
 
 export interface AgentSessionConfig {
+	isolatedSessionFactory?: IsolatedSessionFactory;
 	agent: Agent;
 	sessionManager: SessionManager;
 	settingsManager: SettingsManager;
@@ -305,6 +308,10 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
 // ============================================================================
 
 export class AgentSession {
+	private _contextProjection: SessionContextProjection | undefined;
+	private _executionHeld = false;
+	private _holdAbortController: AbortController | undefined;
+	private _isolatedSessionFactory: IsolatedSessionFactory | undefined;
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
 	readonly settingsManager: SettingsManager;
@@ -399,6 +406,17 @@ export class AgentSession {
 		this._unsubscribeAgent = this.agent.subscribe(this._handleAgentEvent);
 		this._installAgentToolHooks();
 		this._installAgentNextTurnRefresh();
+		this._isolatedSessionFactory = config.isolatedSessionFactory;
+		const previousStop = this.agent.shouldStopAfterTurn;
+		this.agent.shouldStopAfterTurn = async (turn, signal) =>
+			this._executionHeld ||
+			(this._contextProjection !== undefined && signal?.aborted === true) ||
+			(await previousStop?.(turn, signal)) === true;
+		const previousTransform = this.agent.transformContext;
+		this.agent.transformContext = async (messages, signal) => {
+			const effective = this._contextProjection?.(messages) ?? messages;
+			return previousTransform ? previousTransform(effective, signal) : effective;
+		};
 
 		this._buildRuntime({
 			activeToolNames: this._initialActiveToolNames,
@@ -537,14 +555,19 @@ export class AgentSession {
 	}
 
 	private async _compactBeforeNextAssistantResponse(context: AgentContext): Promise<AgentContext> {
+		if (this._contextProjection)
+			context = { ...context, messages: this._contextProjection(this.agent.state.messages.slice()) };
 		const model = this.model;
 		const settings = this.settingsManager.getCompactionSettings();
+		const estimate = estimateContextTokens(context.messages);
+		const boundary = this._contextProjection ? getLatestCompactionEntry(this.sessionManager.getBranch()) : null;
+		const usageMessage = estimate.lastUsageIndex === null ? undefined : context.messages[estimate.lastUsageIndex];
+		const tokens =
+			boundary && usageMessage && usageMessage.timestamp <= Date.parse(boundary.timestamp)
+				? estimateMessagesTokens(context.messages)
+				: estimate.tokens;
 
-		if (
-			!model ||
-			model.contextWindow <= 0 ||
-			!shouldCompact(estimateContextTokens(context.messages).tokens, model.contextWindow, settings)
-		) {
+		if (!model || model.contextWindow <= 0 || !shouldCompact(tokens, model.contextWindow, settings)) {
 			return context;
 		}
 
@@ -553,6 +576,37 @@ export class AgentSession {
 			...context,
 			messages: this.agent.state.messages.slice(),
 		};
+	}
+
+	private _getCompactionEntries(): SessionEntry[] {
+		const entries = this.sessionManager.getBranch();
+		if (!this._contextProjection) return entries;
+		const messages = entries.flatMap((entry) => (entry.type === "message" ? [entry.message] : []));
+		const key = (message: AgentMessage) =>
+			message.role === "toolResult" ? `tool:${message.toolCallId}` : `${message.role}:${message.timestamp}`;
+		const effective = new Map<string, AgentMessage[]>();
+		for (const message of this._contextProjection(messages, "compaction")) {
+			const group = effective.get(key(message)) ?? [];
+			group.push(message);
+			effective.set(key(message), group);
+		}
+		return entries.flatMap((entry): SessionEntry[] => {
+			if (entry.type !== "message") return [entry];
+			const group = effective.get(key(entry.message));
+			const original = group?.indexOf(entry.message) ?? -1;
+			const message = original >= 0 ? group!.splice(original, 1)[0] : group?.shift();
+			return message ? [{ ...entry, message }] : [];
+		});
+	}
+
+	private _prepareEffectiveCompaction(
+		entries: SessionEntry[],
+		settings: ReturnType<SettingsManager["getCompactionSettings"]>,
+	): CompactionPreparation | undefined {
+		const preparation = prepareCompaction(entries, settings);
+		if (preparation && this._contextProjection)
+			preparation.tokensBefore = estimateMessagesTokens(buildSessionContext(entries).messages);
+		return preparation;
 	}
 
 	private _installAgentNextTurnRefresh(): void {
@@ -1117,6 +1171,7 @@ export class AgentSession {
 	private async _handlePostAgentRun(): Promise<boolean> {
 		const msg = this._lastAssistantMessage;
 		this._lastAssistantMessage = undefined;
+		if (this._executionHeld) return false;
 		if (!msg) {
 			return false;
 		}
@@ -1154,6 +1209,8 @@ export class AgentSession {
 	 * @throws Error if no model selected or no API key available (when not streaming)
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
+		if (this.isIdle && !this._executionHeld && this._holdAbortController?.signal.aborted)
+			this._holdAbortController = undefined;
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 		const preflightResult = options?.preflightResult;
 		let messages: AgentMessage[] | undefined;
@@ -1204,6 +1261,10 @@ export class AgentSession {
 			}
 
 			// If streaming, queue via steer() or followUp() based on option
+			if (this._executionHeld)
+				throw new Error(
+					"Agent execution is held at a coordination boundary; wait for diagnosis or use the run's resume command.",
+				);
 			if (this.isStreaming) {
 				if (!options?.streamingBehavior) {
 					throw new Error(
@@ -1614,6 +1675,9 @@ export class AgentSession {
 	 * Abort current operation and wait for agent to become idle.
 	 */
 	async abort(): Promise<void> {
+		// Keep cancellation observable through settlement, after agent-core clears its active signal.
+		if (this._contextProjection && !this._holdAbortController) this._holdAbortController = new AbortController();
+		this._holdAbortController?.abort();
 		this.abortRetry();
 		this.abortCompaction();
 		this.abortBranchSummary();
@@ -1904,6 +1968,18 @@ export class AgentSession {
 		env: Record<string, string> | undefined,
 		reason: "manual" | "threshold" | "overflow",
 	): Promise<CompactionResult> {
+		const stream: StreamFn = this._contextProjection
+			? (model, context, options) => {
+					// Conservative request estimate, including prompts/previous summary; not a tokenizer.
+					const input = Math.ceil(Buffer.byteLength(JSON.stringify(context), "utf8") / 3) + 256;
+					const output = options?.maxTokens ?? 0;
+					if (model.contextWindow > 0 && input + output > model.contextWindow)
+						throw new Error(
+							`Compaction request exceeds the model window (estimated input ${input} + output ${output} > ${model.contextWindow}). Original transcript is retained.`,
+						);
+					return this.agent.streamFunction(model, context, options);
+				}
+			: this.agent.streamFunction;
 		return compact(
 			preparation,
 			requestModel,
@@ -1912,7 +1988,7 @@ export class AgentSession {
 			customInstructions,
 			signal,
 			this.thinkingLevel,
-			this.agent.streamFunction,
+			stream,
 			env,
 			this.settingsManager.getRetrySettings(),
 			this._summarizationRetryCallbacks({ source: "compaction", reason }),
@@ -1953,10 +2029,10 @@ export class AgentSession {
 
 			const { model: requestModel, apiKey, headers, env } = await this._getSummarizationRequestAuth(this.model);
 
-			const pathEntries = this.sessionManager.getBranch();
+			const pathEntries = this._getCompactionEntries();
 			const settings = this.settingsManager.getCompactionSettings();
 
-			const preparation = prepareCompaction(pathEntries, settings);
+			const preparation = this._prepareEffectiveCompaction(pathEntries, settings);
 			if (!preparation) {
 				// Check why we can't compact
 				const lastEntry = pathEntries[pathEntries.length - 1];
@@ -2254,9 +2330,9 @@ export class AgentSession {
 
 			const { model: requestModel, apiKey, headers, env } = await this._getSummarizationRequestAuth(this.model);
 
-			const pathEntries = this.sessionManager.getBranch();
+			const pathEntries = this._getCompactionEntries();
 
-			const preparation = prepareCompaction(pathEntries, settings);
+			const preparation = this._prepareEffectiveCompaction(pathEntries, settings);
 			if (!preparation) {
 				return false;
 			}
@@ -2371,6 +2447,7 @@ export class AgentSession {
 				});
 			}
 
+			this._flushPendingCustomMessages();
 			const result: CompactionResult = {
 				summary,
 				firstKeptEntryId,
@@ -2623,7 +2700,22 @@ export class AgentSession {
 				getScopedModels: () => this._scopedModels,
 				isIdle: () => this.isIdle,
 				isProjectTrusted: () => this.settingsManager.isProjectTrusted(),
-				getSignal: () => this.agent.signal,
+				getSignal: () => this._holdAbortController?.signal ?? this.agent.signal,
+				setExecutionHold: (held) => {
+					this._executionHeld = held;
+					if (held && !this._holdAbortController) {
+						this._holdAbortController = new AbortController();
+						if (this.agent.signal?.aborted) this._holdAbortController.abort();
+					}
+					if (!held) this._holdAbortController = undefined;
+				},
+				setContextProjection: (projection) => {
+					this._contextProjection = projection;
+				},
+				createIsolatedSession: async (request) => {
+					if (!this._isolatedSessionFactory) throw new Error("Isolated session factory is unavailable.");
+					return this._isolatedSessionFactory(request);
+				},
 				abort: () => {
 					if (this._extensionAbortHandler) {
 						this._extensionAbortHandler();

@@ -288,6 +288,10 @@ export const noOpUIContext: ExtensionUIContext = {
 export class ExtensionRunner {
 	private extensions: Extension[];
 	private runtime: ExtensionRuntime;
+	private sessionControls: Pick<
+		ExtensionContextActions,
+		"setExecutionHold" | "setContextProjection" | "createIsolatedSession"
+	> = {};
 	private uiContext: ExtensionUIContext;
 	private mode: ExtensionMode = "print";
 	private cwd: string;
@@ -360,6 +364,11 @@ export class ExtensionRunner {
 
 		// Context actions (required)
 		this.getModel = contextActions.getModel;
+		this.sessionControls = {
+			setExecutionHold: contextActions.setExecutionHold,
+			setContextProjection: contextActions.setContextProjection,
+			createIsolatedSession: contextActions.createIsolatedSession,
+		};
 		this.getScopedModels = contextActions.getScopedModels;
 		this.isIdleFn = contextActions.isIdle;
 		this.isProjectTrustedFn = contextActions.isProjectTrusted;
@@ -815,6 +824,20 @@ export class ExtensionRunner {
 			getSystemPrompt: () => {
 				runner.assertActive();
 				return runner.getSystemPromptFn();
+			},
+			setExecutionHold: (held) => {
+				runner.assertActive();
+				runner.sessionControls.setExecutionHold?.(held);
+			},
+			setContextProjection: (projection) => {
+				runner.assertActive();
+				runner.sessionControls.setContextProjection?.(projection);
+			},
+			createIsolatedSession: async (request) => {
+				runner.assertActive();
+				if (!runner.sessionControls.createIsolatedSession)
+					throw new Error("Isolated session factory is unavailable.");
+				return runner.sessionControls.createIsolatedSession(request);
 			},
 		};
 	}

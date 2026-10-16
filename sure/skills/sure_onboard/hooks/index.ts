@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
-import type { SureHookContext, SureHookResult } from "@earendil-works/pi-coding-agent/hooks";
+import type { SureCheckEvidence, SureHookContext, SureHookResult } from "@earendil-works/pi-coding-agent/hooks";
 import { agentBinDir, demoteAgentBinDir } from "../../../runtime/agent-path.ts";
 import { TASK_TYPES } from "../../../runtime/evaluation/task-types.generated.ts";
 import { type HarnessRuntimeContract, resolveHarnessPython } from "../../../runtime/harness/resolve.ts";
@@ -667,6 +667,7 @@ export function preStart(ctx: SureHookContext): SureHookResult {
 
 	return {
 		ok: true,
+		check: checkEvidence(ctx, FIRST_UNIT, "pending", undefined, undefined, undefined, undefined, modelDir),
 		state_patch: {
 			phase: phaseFor(findUnit(checkpoint.data.currentUnit) ?? FIRST_UNIT, "running"),
 			message: `SURE model-tool skill loaded for model "${args.model_id}" as "${args.model_name}"${resolved.modelInputPath ? " from MODEL_INPUT" : ""}; package=${args.package_profile}; Harness Runtime ${runtime.contract.runtime_id} (→ ${modelDir ?? "(no dir)"}).`,
@@ -893,18 +894,91 @@ function runGateScript(ctx: SureHookContext, unit: Unit): GateResult | undefined
 			? ["--kind", unit.id.replace("validate_", "")]
 			: [];
 	const r = runBackend(ctx, unit.gateScript, ["--produces", produces, ...kindArgs, ...extra]);
+	const execution = { exitCode: r.status, stdout: r.stdout.slice(-16_000), stderr: r.stderr.slice(-16_000) };
 	if (r.ok) {
-		return { ok: true };
+		return { ok: true, execution };
 	}
 	const repair = r.stderr?.trim() || r.stdout?.trim() || `Gate script scripts/${unit.gateScript} exited ${r.status}.`;
-	return { ok: false, repair, reason: `gate script ${unit.gateScript} failed` };
+	return {
+		ok: false,
+		repair,
+		reason: `gate script ${unit.gateScript} failed`,
+		execution,
+	};
+}
+
+function checkEvidence(
+	ctx: SureHookContext,
+	unit: Unit,
+	outcome: SureCheckEvidence["outcome"],
+	failureKind?: SureCheckEvidence["failureKind"],
+	summary = `Unit ${unit.id}: ${outcome}`,
+	repair?: string,
+	gate?: GateResult,
+	initialModelDir?: string,
+): SureCheckEvidence {
+	const modelDir = initialModelDir ?? modelDirFromResolvedArtifact(ctx);
+	const options = unit.id === "load_model_input" ? parseArgs(ctx.args) : {};
+	const originalInput = options.model_input_path ?? options.model_input;
+	const modelInput = originalInput
+		? resolveExistingPath(ctx, originalInput)
+		: options.model
+			? resolveHandoffModelInputPath(ctx, options.model).path
+			: undefined;
+	return {
+		unitId: unit.id,
+		outcome,
+		failureKind,
+		diagnosticPaths:
+			unit.id === "load_model_input" ? ["run:evidence/invocation.json", ...(modelInput ? [modelInput] : [])] : [],
+		summary,
+		repair,
+		artifactPaths: [`run:artifacts/${unit.produces}`],
+		inputPaths: [
+			"run:artifacts",
+			...(unit.schemaRef ? [`package:schemas/${unit.schemaRef}`] : []),
+			...(unit.gateScript ? [`package:scripts/${unit.gateScript}`] : []),
+			...(modelDir
+				? [
+						"model.py",
+						"server.py",
+						"__init__.py",
+						"validate.py",
+						"config.yaml",
+						"model.spec.yaml",
+						"requirements.lock",
+						"model_runtime_manifest.json",
+					]
+						.map((name) => join(modelDir, name))
+						.concat(modelDir)
+				: []),
+		],
+		checker: unit.gateScript ?? "validateProduces",
+		exitCode: gate?.execution?.exitCode,
+		stdout: gate?.execution?.stdout,
+		stderr: gate?.execution?.stderr,
+		// Structural validation is a real milestone even if the semantic gate
+		// still fails. File edits and changed error wording alone are not progress.
+		progress: {
+			key: "unit_validation",
+			completed:
+				outcome === "passed" ? 2 : failureKind === "semantic" || failureKind === "checker_exception" ? 1 : 0,
+		},
+	};
 }
 
 export function postToolResult(ctx: SureHookContext): SureHookResult {
 	const event = isRecord(ctx.event) ? ctx.event : {};
+	const checkpoint = readCheckpoint(ctx);
+	const currentUnit = findUnit(checkpoint.data.currentUnit);
 	if (event.isError === true) {
 		return {
 			ok: true,
+			check: {
+				...checkEvidence(ctx, currentUnit ?? FIRST_UNIT, "blocked", "tool", "Execution tool returned an error."),
+				recovery: "local_once",
+				repair: "Inspect the tool output, repair the command or artifact, and continue.",
+			},
 			state_patch: {
 				phase: { id: "tool_result", label: "Inspecting tool result", status: "blocked" },
 				diagnostics: [
@@ -918,8 +992,6 @@ export function postToolResult(ctx: SureHookContext): SureHookResult {
 		};
 	}
 
-	const checkpoint = readCheckpoint(ctx);
-	const currentUnit = findUnit(checkpoint.data.currentUnit);
 	if (!currentUnit) {
 		return failure(
 			`Unknown current unit "${checkpoint.data.currentUnit}". Reset the checkpoint.`,
@@ -940,7 +1012,7 @@ export function postToolResult(ctx: SureHookContext): SureHookResult {
 			// never runs and nothing ever consumes a retry.
 			const parseError = artifactParseError(ctx, currentUnit.produces);
 			if (!parseError) {
-				return { ok: true };
+				return { ok: true, check: checkEvidence(ctx, currentUnit, "pending") };
 			}
 			return failOrRetry(
 				ctx,
@@ -948,6 +1020,7 @@ export function postToolResult(ctx: SureHookContext): SureHookResult {
 				checkpoint,
 				`${currentUnit.produces} is present but is not valid JSON: ${parseError}. Rewrite it as a single JSON object; unit "${currentUnit.id}" cannot advance until it parses.`,
 				"produces is not valid JSON",
+				"format",
 			);
 		}
 		return failOrRetry(
@@ -956,6 +1029,7 @@ export function postToolResult(ctx: SureHookContext): SureHookResult {
 			checkpoint,
 			producesResult.repair ?? `Unit "${currentUnit.id}" produces invalid.`,
 			producesResult.reason ?? "produces invalid",
+			"format",
 		);
 	}
 
@@ -988,6 +1062,8 @@ export function postToolResult(ctx: SureHookContext): SureHookResult {
 				checkpoint,
 				gateRun.repair ?? `Gate script "${currentUnit.id}" failed.`,
 				gateRun.reason ?? "gate script failed",
+				gateRun.execution?.exitCode === null ? "checker_exception" : "semantic",
+				gateRun,
 			);
 		}
 	}
@@ -1014,6 +1090,17 @@ export function postToolResult(ctx: SureHookContext): SureHookResult {
 	}
 	return {
 		ok: true,
+		check: checkEvidence(
+			ctx,
+			currentUnit,
+			gateRun?.ranFailed ? "skipped" : "passed",
+			gateRun?.ranFailed ? "checker_exception" : undefined,
+			gateRun?.ranFailed
+				? "Optional memory extraction checker was unavailable; extraction marked failed and business flow advanced."
+				: undefined,
+			undefined,
+			gateRun,
+		),
 		state_patch: {
 			phase: phaseFor(findUnit(next.data.currentUnit) ?? LAST_UNIT, "running"),
 			message: `Advanced to unit "${next.data.currentUnit}".`,
@@ -1045,6 +1132,13 @@ function unchangedFailedArtifact(
 	const attempts = checkpoint.data.retries[unit.id] ?? 0;
 	return {
 		ok: true,
+		check: checkEvidence(
+			ctx,
+			unit,
+			"unchanged",
+			"no_progress",
+			"Gate remains blocked on unchanged artifact content.",
+		),
 		state_patch: {
 			phase: phaseFor(unit, "blocked"),
 			message: `Gate "${unit.id}" remains blocked on unchanged artifact content; retry ${attempts} was not consumed again.`,
@@ -1067,6 +1161,8 @@ function failOrRetry(
 	checkpoint: { data: CheckpointData },
 	repair: string,
 	reason: string,
+	failureKind: SureCheckEvidence["failureKind"] = "semantic",
+	gate?: GateResult,
 ): SureHookResult {
 	// produces plus gateInputs: editing a candidate must re-run the extraction gate and cost a
 	// retry, exactly like editing the declaration itself (spec 4.1). undefined means the digest
@@ -1077,6 +1173,7 @@ function failOrRetry(
 		const attempts = checkpoint.data.retries[unit.id] ?? 0;
 		return {
 			ok: true,
+			check: checkEvidence(ctx, unit, "unchanged", "no_progress", reason, repair, gate),
 			state_patch: {
 				phase: phaseFor(unit, "blocked"),
 				message: `Gate "${unit.id}" remains blocked on unchanged artifact content; retry ${attempts} was not consumed again.`,
@@ -1132,6 +1229,15 @@ function failOrRetry(
 			// digest.py reads (together with phase id "gate") as "unit failed for good".
 			return {
 				ok: true,
+				check: checkEvidence(
+					ctx,
+					unit,
+					"skipped",
+					failureKind,
+					"Optional memory extraction exhausted; business flow advanced.",
+					repair,
+					gate,
+				),
 				state_patch: {
 					phase: phaseFor(findUnit(advanced.data.currentUnit) ?? LAST_UNIT, "running"),
 					message: `Extraction gate "${unit.id}" exhausted ${attempts} blocked attempts; extraction marked failed, advanced to unit "${advanced.data.currentUnit}".`,
@@ -1162,6 +1268,7 @@ function failOrRetry(
 		const memoryBlock = injected.repair.slice(repair.length);
 		return {
 			ok: false,
+			check: checkEvidence(ctx, unit, "exhausted", failureKind, message, repair, gate),
 			repair: `${repair} Blocked because: ${reason}. After ${attempts} consecutive blocked attempts, /sure_onboard still cannot produce a valid artifact for unit "${unit.id}". If the blocking reason above points at the model_input_path or repo link rather than the artifact you wrote, ask the user to confirm access permissions and whether the referenced documentation covers install, load, inference, and artifacts.${memoryBlock}`,
 			state_patch: {
 				phase: { id: "gate", label: "SURE onboard gate blocked", status: "blocked" },
@@ -1175,6 +1282,7 @@ function failOrRetry(
 	return {
 		ok: false,
 		repair: injected.repair,
+		check: checkEvidence(ctx, unit, "blocked", failureKind, reason, repair, gate),
 		state_patch: {
 			phase: phaseFor(unit, "blocked"),
 			message: `Gate "${unit.id}" blocked (attempt ${attempts}): ${reason}`,
@@ -1254,11 +1362,11 @@ export function preFinish(ctx: SureHookContext): SureHookResult {
 			state_patch: {
 				phase: {
 					id: "finish",
-					label: "SURE model-tool stopped before registry delivery",
+					label: "SURE model-tool stopped before completion",
 					status: finishStatus as "failed" | "incomplete",
 					progress: 1,
 				},
-				message: "Local model and container evidence retained; no Eval-ready deployment was claimed.",
+				message: "Run evidence retained; no Eval-ready deployment was claimed.",
 				counters: countersFor(checkpoint.data, 1),
 				checkpoint: withMemory(checkpoint, memory),
 				// "incomplete", not "blocked": the harness normalizer accepts draft / ready / failed /
@@ -1273,7 +1381,7 @@ export function preFinish(ctx: SureHookContext): SureHookResult {
 						name: "Blocked deployment marker",
 						path: `.sure/runs/${ctx.run.runId}/artifacts/${LAST_UNIT.produces}`,
 						status: "incomplete",
-						summary: "Container validation evidence is present, but registry delivery is incomplete.",
+						summary: "Onboarding did not establish an Eval-ready deployment.",
 					},
 				],
 				...(diagnostics.length > 0 ? { diagnostics } : {}),

@@ -19,6 +19,7 @@ import { AgentSession, type AgentSessionEvent } from "../../src/core/agent-sessi
 import { AuthStorage } from "../../src/core/auth-storage.ts";
 import type { ExtensionRunner } from "../../src/core/extensions/index.ts";
 import { convertToLlm } from "../../src/core/messages.ts";
+import type { IsolatedSessionFactory } from "../../src/core/session-controls.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
 import type { Settings } from "../../src/core/settings-manager.ts";
 import { SettingsManager } from "../../src/core/settings-manager.ts";
@@ -61,6 +62,7 @@ export function getAssistantTexts(harness: Harness): string[] {
 }
 
 export interface HarnessOptions {
+	isolatedSessionFactory?: IsolatedSessionFactory;
 	models?: FauxModelDefinition[];
 	settings?: Partial<Settings>;
 	systemPrompt?: string;
@@ -180,6 +182,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		options.resourceLoader ?? createTestResourceLoader(extensionsResult ? { extensionsResult } : undefined);
 
 	const session = new AgentSession({
+		isolatedSessionFactory: options.isolatedSessionFactory,
 		agent,
 		sessionManager,
 		settingsManager,

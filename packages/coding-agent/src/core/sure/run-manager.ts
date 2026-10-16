@@ -1,15 +1,7 @@
 import { randomUUID } from "node:crypto";
-import {
-	appendFileSync,
-	cpSync,
-	existsSync,
-	mkdirSync,
-	readdirSync,
-	readFileSync,
-	renameSync,
-	writeFileSync,
-} from "node:fs";
+import { appendFileSync, cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
+import { writeSureJson } from "./evidence.ts";
 import { mergeSureDisplayState } from "./state.ts";
 import type { SureDisplayState, SureRunRecord, SureRunStatus, SureSkillPackage } from "./types.ts";
 
@@ -41,15 +33,6 @@ function listProducts(outputDir: string): string[] {
 
 function safeTimestamp(): string {
 	return nowIso().replace(/[-:]/g, "").replace(/\..+$/, "").replace("T", "-");
-}
-
-// A run's record is rewritten on every tool call, so a hard kill during the
-// write is what leaves a zero-byte run.json behind. Publish through a rename
-// inside the same directory: the file is either the old one or the new one.
-function writeJson(path: string, value: unknown): void {
-	const tmpPath = `${path}.sure-run-tmp`;
-	writeFileSync(tmpPath, `${JSON.stringify(value, null, 2)}\n`, "utf-8");
-	renameSync(tmpPath, path);
 }
 
 // One unreadable file must not answer with a bare "Unexpected end of JSON
@@ -175,7 +158,7 @@ export class SureRunManager {
 
 	private writeRecord(record: SureRunRecord): void {
 		mkdirSync(record.runDir, { recursive: true });
-		writeJson(join(record.runDir, "run.json"), record);
+		writeSureJson(join(record.runDir, "run.json"), record);
 		this.writeResult(record);
 	}
 
@@ -193,8 +176,36 @@ export class SureRunManager {
 			if (existsSync(artifactsDir)) {
 				cpSync(artifactsDir, join(outputDir, "artifacts"), { recursive: true });
 			}
+			if (existsSync(join(record.runDir, "coordination.json")))
+				for (const name of [
+					"coordination.json",
+					"state.json",
+					"events.jsonl",
+					"evidence",
+					"snapshots",
+					"diagnoses",
+					"supervisor",
+					"failure-report.json",
+					"failure-report.md",
+				]) {
+					const source = join(record.runDir, name);
+					if (existsSync(source))
+						cpSync(source, join(outputDir, name), {
+							recursive: true,
+							filter: (from, to) => {
+								const stat = lstatSync(from);
+								return (
+									!stat.isFile() ||
+									!existsSync(to) ||
+									!lstatSync(to).isFile() ||
+									stat.size !== lstatSync(to).size ||
+									!readFileSync(from).equals(readFileSync(to))
+								);
+							},
+						});
+				}
 		}
-		writeJson(join(outputDir, RESULT_FILE), {
+		writeSureJson(join(outputDir, RESULT_FILE), {
 			schema: "sure.run_result.v1",
 			command: `/${record.command.replace(/^\//, "")}`,
 			args: record.args,
@@ -212,7 +223,7 @@ export class SureRunManager {
 
 	private writeState(record: SureRunRecord, state: SureDisplayState): void {
 		mkdirSync(record.runDir, { recursive: true });
-		writeJson(join(record.runDir, "state.json"), state);
+		writeSureJson(join(record.runDir, "state.json"), state);
 	}
 
 	private appendEvent(runId: string, event: SureRunEvent): void {

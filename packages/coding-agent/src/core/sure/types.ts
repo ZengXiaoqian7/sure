@@ -1,4 +1,7 @@
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
+import type { SureCheckEvidence, SureCoordinationPolicy } from "./coordination-types.ts";
+
+export type { SureCheckEvidence, SureCoordinationPolicy } from "./coordination-types.ts";
 
 export type SureRunStatus = "pending" | "running" | "success" | "failed" | "incomplete" | "cancelled";
 
@@ -7,6 +10,7 @@ export type SureHookPoint =
 	| "pre_tool_call"
 	| "post_tool_result"
 	| "pre_finish"
+	| "prepare_stop"
 	| "post_finish"
 	| "on_error";
 
@@ -36,6 +40,7 @@ export interface SureSkillManifest {
 	hooks?: Partial<Record<SureHookPoint, SureHookDeclaration[]>>;
 	artifacts?: SureArtifactRequirement[];
 	ui?: SureSkillUiHints;
+	coordination?: SureCoordinationPolicy;
 }
 
 export interface SureSkillPackage {
@@ -151,6 +156,8 @@ export interface SureHookContext {
 }
 
 export interface SureHookResult {
+	finish?: SureFinishParams;
+	check?: SureCheckEvidence;
 	ok?: boolean;
 	message?: string;
 	repair?: string;

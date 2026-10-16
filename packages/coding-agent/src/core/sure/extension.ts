@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
-import { basename, isAbsolute, relative, resolve } from "node:path";
+import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
+import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
 	type AgentEndEvent,
@@ -10,24 +11,53 @@ import {
 	type ExtensionContext,
 	type ExtensionFactory,
 } from "../extensions/index.ts";
+import { sessionEntryToContextMessages } from "../session-manager.ts";
+import { SESSION_OUTCOME_ENTRY } from "../session-outcome.ts";
+import {
+	buildSureCommonPrompt,
+	buildSureStagePrompt,
+	captureSureExecutorProgress,
+	planSureContextTrim,
+	projectSureContext,
+	sureCurrentUnit,
+	surePromptPaths,
+} from "./context.ts";
+import {
+	SURE_COORDINATION_LIMITS,
+	type SureCheckEvidence,
+	type SureDiagnosisCheckpoint,
+} from "./coordination-types.ts";
+import { SureCoordinator } from "./coordinator.ts";
+import { loadSureCheckRecords, loadSureDiagnosticIndex } from "./diagnostic-view.ts";
+import { readSureSnapshot, sureHash, writeSureJson } from "./evidence.ts";
+import {
+	buildSureFailureReport,
+	persistSureFailureReport,
+	renderSureFailureReport,
+	type SureFailureReport,
+} from "./failure-report.ts";
 import { SureHookRunner } from "./hooks.ts";
 import { runSureInit } from "./init.ts";
 import type { SureInitManifest } from "./init-types.ts";
 import { discoverSureSkillPackages, SURE_COMMANDS, type SureDiscoveryDiagnostic } from "./manifest.ts";
 import { resolveOutputDir, stripOutputDir } from "./output-dir.ts";
+import { acquireSureRunOwnership, type SureRunOwnership } from "./ownership.ts";
 import { SureRunManager } from "./run-manager.ts";
 import { formatSureDisplayStatus, normalizeSureDisplayStatePatch } from "./state.ts";
+import { diagnoseSureRun } from "./supervisor.ts";
 import type {
 	SureArtifactRequirement,
 	SureDisplayState,
 	SureFinishDetails,
 	SureFinishParams,
+	SureHookResult,
 	SureManifestEnvelope,
 	SureRunRecord,
 	SureSkillPackage,
 	SureToolContent,
 	SureUpdateStateDetails,
 } from "./types.ts";
+import { readSureUserContext, syncSureUserContext } from "./user-context.ts";
 
 const FINISH_TOOL_NAME = "sure_finish";
 const UPDATE_STATE_TOOL_NAME = "sure_update_state";
@@ -38,7 +68,8 @@ const finishToolParams = Type.Object({
 		description: "Final Sure run status.",
 	}),
 	manifest_path: Type.String({
-		description: "Path to the final artifact manifest, relative to the project cwd or absolute under the project.",
+		description:
+			"Path to the run-level Sure finish manifest (normally .sure/runs/<run_id>/manifest.json), not a skill-produced artifact manifest such as Feed's artifacts/debug/handoff_manifest.json; use a project-relative path or an absolute path inside the project.",
 	}),
 	summary: Type.String({ description: "Concise final summary of the Sure run." }),
 	artifacts: Type.Optional(Type.Unsafe<unknown>({ description: "Structured final artifact summary." })),
@@ -75,6 +106,19 @@ const displayArtifactParams = Type.Object({
 });
 
 const updateStateToolParams = Type.Object({
+	repair_verification: Type.Optional(
+		Type.Object(
+			{
+				repair_id: Type.String({ minLength: 1 }),
+				check_version: Type.Integer({ minimum: 1 }),
+				relation: StringEnum(["recheck", "independent", "related"] as const),
+			},
+			{
+				description:
+					"Associate an actually recorded result with a repair: original-condition recheck, independent error, or another object within the same goal. Never a claimed gate pass.",
+			},
+		),
+	),
 	phase: Type.Optional(displayPhaseParams),
 	message: Type.Optional(Type.String({ description: "Current run message for TUI/WebUI display." })),
 	progress: Type.Optional(Type.Number({ description: "Optional overall progress value." })),
@@ -85,6 +129,32 @@ const updateStateToolParams = Type.Object({
 });
 
 interface ActiveRun {
+	ownership?: SureRunOwnership;
+	batchId?: string;
+	/** Request identity survives stage changes while parallel tools are running. */
+	toolInvocations?: Map<
+		string,
+		{
+			identity: {
+				unitId: string;
+				batchId?: string;
+				requestedAt: string;
+				order: number;
+				cwd: string;
+				toolName: string;
+				input: unknown;
+			};
+			settled: Promise<void>;
+			complete: () => void;
+		}
+	>;
+	coordinator?: SureCoordinator;
+	trimmedCalls?: string[];
+	compactionTrim?: string[];
+	resultQueue?: Promise<void>;
+	terminalizing?: boolean;
+	shuttingDown?: boolean;
+	diagnosis?: ReturnType<typeof diagnoseSureRun>;
 	record: SureRunRecord;
 	skillPackage: SureSkillPackage;
 	hooks: SureHookRunner;
@@ -98,7 +168,7 @@ interface ActiveRun {
 }
 
 /** Cap on automatic continuation prompts for headless (print/json) runs. */
-const MAX_FINISH_NUDGES = 3;
+const MAX_FINISH_NUDGES = SURE_COORDINATION_LIMITS.finishNudges;
 
 function buildFinishNudge(run: SureRunRecord): string {
 	return [
@@ -124,7 +194,9 @@ export function buildInvocationPrompt(skillPackage: SureSkillPackage, run: SureR
 		"Run this Sure skill as a scientific task. Produce durable artifacts in the run directory or project workspace.",
 		"Use the skill instructions below. References are relative to the package directory.",
 		"",
-		skillPackage.prompt,
+		skillPackage.manifest.coordination
+			? `# /${skillPackage.manifest.command}\nThe harness supplies common rules, the current unit contract and reference entry points in the effective stage context.`
+			: skillPackage.prompt,
 		"",
 		"Completion protocol:",
 		`- Finish by calling ${FINISH_TOOL_NAME} as a standalone final tool call.`,
@@ -237,6 +309,7 @@ function applyStatePatch(
 	if (patchValue === undefined) {
 		return { ok: true };
 	}
+	active.ownership?.assertCurrent();
 	const normalized = normalizeSureDisplayStatePatch(patchValue);
 	if (!normalized.ok || !normalized.state) {
 		const repair = normalized.message ?? "Invalid Sure state patch.";
@@ -248,7 +321,17 @@ function applyStatePatch(
 		return { ok: false, repair };
 	}
 	const runManager = new SureRunManager(active.record.cwd);
+	const previous = runManager.readState(active.record);
 	const state = runManager.updateState(active.record, normalized.state, eventType);
+	if (
+		active.skillPackage.manifest.coordination &&
+		(previous?.phase?.id !== state.phase?.id || previous?.message !== state.message)
+	) {
+		ctx.ui.notify(
+			`${state.phase?.label ?? state.phase?.id ?? "SURE"}: ${normalized.state.message ?? normalized.state.diagnostics?.at(-1)?.message ?? normalized.state.phase?.status ?? "running"}`,
+			state.phase?.status === "blocked" ? "warning" : "info",
+		);
+	}
 	pi.appendEntry("sure.state", {
 		runId: active.record.runId,
 		command: active.record.command,
@@ -261,6 +344,259 @@ function applyStatePatch(
 
 function activeToolNames(active: ActiveRun): string[] {
 	return [...new Set([...active.previousActiveTools, FINISH_TOOL_NAME, UPDATE_STATE_TOOL_NAME])];
+}
+
+function installCoordinatedContext(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	active: ActiveRun,
+	extraScope: string[] = [],
+): void {
+	const policy = active.skillPackage.manifest.coordination;
+	if (!policy) return;
+	const manager = new SureRunManager(active.record.cwd);
+	const unit = sureCurrentUnit(active.skillPackage, manager.readState(active.record));
+	const stage = policy.stages.find((stage) => stage.id === unit);
+	const scope = [...(stage?.snapshotPaths ?? []), ...surePromptPaths(active.skillPackage, unit), ...extraScope];
+	active.coordinator = new SureCoordinator(
+		active.record,
+		unit,
+		scope,
+		policy.budgets,
+		active.ownership?.assertCurrent,
+	);
+	syncSureUserContext(
+		active.coordinator,
+		ctx.sessionManager.getBranch().flatMap((entry) => (entry.type === "message" ? [entry.message] : [])),
+	);
+	const coordinator = active.coordinator;
+	const coordination = coordinator.state;
+	const phase = manager.readState(active.record)?.phase;
+	if (phase?.id === unit && phase.label) {
+		coordination.unitLabel = phase.label;
+		active.coordinator.save();
+	}
+	if (coordination.stageStartedAt === undefined) {
+		coordination.stageStartedAt = Date.now();
+		coordination.stageUnitId = unit;
+		active.coordinator.save();
+	}
+	const savedTrim = ctx.sessionManager
+		.getBranch()
+		.reverse()
+		.find(
+			(entry) =>
+				entry.type === "custom" &&
+				entry.customType === "sure.context.trim" &&
+				(entry.data as { runId?: string })?.runId === active.record.runId,
+		);
+	active.trimmedCalls = savedTrim?.type === "custom" ? (savedTrim.data as { calls: string[] }).calls : [];
+	ctx.setContextProjection?.((messages, purpose) =>
+		projectSureContext(
+			messages,
+			purpose === "compaction"
+				? planSureContextTrim(
+						messages,
+						coordination.stageStartedAt ?? 0,
+						coordination,
+						loadSureCheckRecords(coordinator),
+					)
+				: (active.trimmedCalls ?? []),
+		),
+	);
+	syncCoordinatedMessages(pi, ctx, active, true);
+}
+
+/** Native custom-message queue: persisted once, after a whole tool batch, without starting a turn. */
+function syncCoordinatedMessages(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	active: ActiveRun,
+	restoreEvidence = false,
+): void {
+	const coordinator = active.coordinator;
+	if (!coordinator || coordinator.isStopped || active.shuttingDown) return;
+	active.ownership?.assertCurrent();
+	const state = new SureRunManager(active.record.cwd).readState(active.record);
+	const unit = sureCurrentUnit(active.skillPackage, state);
+	if (coordinator.state.stageUnitId !== unit) {
+		coordinator.state.stageUnitId = unit;
+		coordinator.state.stageStartedAt = Date.now();
+		coordinator.save();
+	}
+	const view = ctx.sessionManager.buildContextEntries().flatMap(sessionEntryToContextMessages);
+	const append = (kind: string, text: string) => {
+		const id = `${active.record.runId}:${kind}:${sureHash(text)}`;
+		if (
+			view.some(
+				(message) =>
+					message.role === "custom" &&
+					(message.details as { sureContextId?: string } | undefined)?.sureContextId === id,
+			)
+		)
+			return;
+		pi.sendMessage(
+			{ customType: `sure_${kind}`, content: text, display: false, details: { sureContextId: id } },
+			{ triggerTurn: false },
+		);
+	};
+	append("common_context", buildSureCommonPrompt(active.skillPackage, active.record));
+	append(
+		"stage_context",
+		`<sure_stage_context>\n${buildSureStagePrompt(active.skillPackage, active.record, state)}\n</sure_stage_context>`,
+	);
+	const constraints = readSureUserContext(coordinator, view);
+	if (constraints) append("user_context", constraints);
+	for (const repair of coordinator.state.repairs ?? []) {
+		if (repair.source !== "executor" || repair.unitId !== unit) continue;
+		append(
+			"local_correction",
+			`Recorded local correction: ${JSON.stringify({ id: repair.id, triggerCheckVersion: repair.triggerCheckVersion, verificationCheckVersion: repair.verificationCheckVersion, outcome: repair.outcome, task: repair.task })}. This records the same correction, not a new allowance; actual original-condition verification and the original gate remain authoritative.`,
+		);
+	}
+	if (restoreEvidence) {
+		const records = loadSureCheckRecords(coordinator);
+		const required = new Map<string, SureCheckEvidence>();
+		for (const repair of coordinator.state.repairs ?? []) {
+			if (["passed", "skipped", "invalidated", "stopped"].includes(repair.outcome)) continue;
+			for (const version of [repair.triggerCheckVersion, repair.verificationCheckVersion]) {
+				const check = records.find((record) => record.version === version)?.check;
+				if (check?.action) required.set(check.action.toolCallId, check);
+			}
+		}
+		if (required.size || coordinator.state.pendingRepair)
+			for (const check of [coordinator.state.originalFailure, coordinator.state.lastFailure])
+				if (check?.action) required.set(check.action.toolCallId, check);
+		for (const [id, check] of required) {
+			if (view.some((message) => message.role === "toolResult" && message.toolCallId === id)) continue;
+			const path = join(active.record.runDir, "evidence/tools", `${sureHash(id)}.json`);
+			if (!existsSync(path)) continue;
+			const action = JSON.parse(readFileSync(path, "utf8")) as {
+				toolName: string;
+				input: unknown;
+				content: unknown;
+				isError: boolean;
+			};
+			append(
+				"unresolved_evidence",
+				`Retained original-condition evidence for unresolved correction; historical, not a current validation. Source: run:evidence/tools/${sureHash(id)}.json\n${JSON.stringify({ toolCallId: id, toolName: action.toolName, input: action.input, content: action.content, isError: action.isError, check })}`,
+			);
+		}
+	}
+	// Keep the most recent task body even when an original gate has cleared pendingRepair.
+	const repair = [...(coordinator.state.repairs ?? [])]
+		.reverse()
+		.find((repair) => repair.source === "supervisor" && repair.unitId === unit);
+	if (
+		repair &&
+		(!coordinator.state.pendingRepair || coordinator.state.pendingRepair.delivered) &&
+		!view.some(
+			(message) =>
+				(message.role === "user" || message.role === "custom") &&
+				(typeof message.content === "string" ? message.content : JSON.stringify(message.content)).includes(
+					`<sure_supervisor_repair id="${repair.id}"`,
+				),
+		)
+	)
+		append(
+			"retained_repair",
+			`<sure_supervisor_repair id="${repair.id}" run_id="${active.record.runId}" unit="${repair.unitId}" retained="true" outcome="${repair.outcome}">\n${repair.task}\n</sure_supervisor_repair>\nRetained body of the same accepted task, not a new assignment. Known recorded outcome: ${repair.outcome}; this gate status alone does not establish every action in the goal. Reuse verified current-version evidence; do not repeat completed work merely because the body was restored.`,
+		);
+}
+
+function coordinatedScope(active: ActiveRun): string[] {
+	const coordinator = active.coordinator;
+	const stage = active.skillPackage.manifest.coordination?.stages.find(
+		(stage) => stage.id === coordinator?.state.unitId,
+	);
+	return [
+		...new Set([
+			...(stage?.snapshotPaths ?? []),
+			...surePromptPaths(active.skillPackage, coordinator?.state.unitId ?? "unknown"),
+			...(coordinator?.state.lastCheck?.inputPaths ?? []),
+			...(coordinator?.state.lastCheck?.artifactPaths ?? []),
+			...(coordinator?.state.lastCheck?.diagnosticPaths ?? []),
+			...[
+				coordinator?.state.lastCheck?.action?.path,
+				coordinator?.state.originalFailure?.action?.path,
+				coordinator?.state.lastFailure?.action?.path,
+			].filter((path): path is string => Boolean(path)),
+			...(stage?.references.map((path) => `package:${path}`) ?? []),
+			...(coordinator
+				? loadSureDiagnosticIndex(coordinator)
+						.actions.filter(
+							(action) =>
+								action.unitId === coordinator.state.unitId ||
+								action.checkUnitId === coordinator.state.unitId ||
+								(active.batchId !== undefined && action.batchId === active.batchId),
+						)
+						.map((action) => action.path)
+				: []),
+		]),
+	];
+}
+
+function observeCoordinatedCheck(
+	active: ActiveRun,
+	ctx: ExtensionContext,
+	check: SureHookResult["check"] | NonNullable<SureHookResult["check"]>[],
+	patch?: unknown,
+	directCorrection = true,
+): void {
+	if (Array.isArray(check)) {
+		if (!check.length) observeCoordinatedCheck(active, ctx, undefined, patch);
+		// Retain each failed source; passing subchecks cannot promote a blocked unit.
+		const priority = { pending: 0, skipped: 1, passed: 2, unchanged: 3, blocked: 4, exhausted: 5 };
+		const units = new Map<string, NonNullable<SureHookResult["check"]>[]>();
+		for (const item of check) {
+			const items = units.get(item.unitId) ?? [];
+			items.push(item);
+			units.set(item.unitId, items);
+		}
+		for (const items of units.values()) {
+			const failures = items.filter((item) => item.outcome === "blocked" || item.outcome === "exhausted");
+			for (const item of failures.length
+				? failures
+				: [items.reduce((a, b) => (priority[a.outcome] >= priority[b.outcome] ? a : b))])
+				observeCoordinatedCheck(active, ctx, item, patch, directCorrection);
+		}
+		return;
+	}
+	const coordinator = active.coordinator;
+	if (!check && isRecord(patch) && isRecord(patch.phase) && patch.phase.status === "blocked") {
+		check = {
+			unitId: sureCurrentUnit(active.skillPackage, new SureRunManager(active.record.cwd).readState(active.record)),
+			outcome: "blocked",
+			summary:
+				typeof patch.message === "string"
+					? patch.message
+					: "The skill reported a blocked phase without an error classification.",
+			artifactPaths: [],
+			inputPaths: [],
+		};
+	}
+	if (!coordinator || !check) return;
+	const phase = new SureRunManager(active.record.cwd).readState(active.record)?.phase;
+	if (phase?.id === check.unitId && phase.label) coordinator.state.unitLabel = phase.label;
+	if (check.unitId === "unknown")
+		check = {
+			...check,
+			unitId: sureCurrentUnit(active.skillPackage, new SureRunManager(active.record.cwd).readState(active.record)),
+		};
+	const stage = active.skillPackage.manifest.coordination?.stages.find((stage) => stage.id === check.unitId);
+	coordinator.observe(
+		check,
+		[
+			...(stage?.snapshotPaths ?? []),
+			...surePromptPaths(active.skillPackage, check.unitId),
+			...check.inputPaths,
+			...check.artifactPaths,
+			...(check.diagnosticPaths ?? []),
+			...(check.action ? [check.action.path] : []),
+		],
+		directCorrection,
+	);
+	if (coordinator.state.status !== "executing") ctx.setExecutionHold?.(true);
 }
 
 function possibleArtifactPaths(runManager: SureRunManager, run: SureRunRecord, pathValue: string): string[] {
@@ -466,6 +802,418 @@ function validateManifestEnvelope(
 	return undefined;
 }
 
+async function finishActiveRun(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	active: ActiveRun,
+	finish: SureFinishParams,
+	setActiveRun: (run: ActiveRun | undefined) => void,
+) {
+	const runManager = new SureRunManager(active.record.cwd);
+	active.ownership?.assertCurrent();
+	if (active.coordinator && (active.shuttingDown || active.coordinator.isStopped || ctx.signal?.aborted))
+		return {
+			content: toolText("SURE finish was interrupted; no completion was accepted."),
+			details: { runId: active.record.runId, accepted: false } satisfies SureFinishDetails,
+		};
+	const manifestPath = runManager.resolveRunPath(active.record, finish.manifest_path);
+	if (!manifestPath || !existsSync(manifestPath)) {
+		const repair = `Create the final manifest at ${finish.manifest_path} inside the project or run workspace, then call ${FINISH_TOOL_NAME} again.`;
+		active.record = runManager.updateRun(active.record, { lastRepair: repair }, "finish_repair", {
+			repair,
+		});
+		return {
+			content: toolText(repair),
+			details: { runId: active.record.runId, accepted: false, repair } satisfies SureFinishDetails,
+		};
+	}
+
+	let manifest: unknown;
+	try {
+		manifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
+	} catch (error) {
+		const repair = `Final manifest must be valid JSON: ${error instanceof Error ? error.message : String(error)}`;
+		active.record = runManager.updateRun(active.record, { lastRepair: repair }, "finish_repair", {
+			repair,
+		});
+		return {
+			content: toolText(repair),
+			details: { runId: active.record.runId, accepted: false, repair } satisfies SureFinishDetails,
+		};
+	}
+
+	const envelopeError = validateManifestEnvelope(manifest, active.record, finish, runManager, active.skillPackage);
+	if (envelopeError) {
+		const repair = `${envelopeError} Repair the manifest and call ${FINISH_TOOL_NAME} again.`;
+		active.record = runManager.updateRun(active.record, { lastRepair: repair }, "finish_repair", {
+			repair,
+		});
+		return {
+			content: toolText(repair),
+			details: { runId: active.record.runId, accepted: false, repair } satisfies SureFinishDetails,
+		};
+	}
+
+	const gate = await active.hooks.run("pre_finish", {
+		run: active.record,
+		skill: active.skillPackage.manifest,
+		cwd: ctx.cwd,
+		packageDir: active.skillPackage.packageDir,
+		runDir: active.record.runDir,
+		args: active.record.args,
+		event: { finish, manifest, manifestPath },
+	});
+	active.ownership?.assertCurrent();
+	if (active.coordinator && (active.shuttingDown || active.coordinator.isStopped || ctx.signal?.aborted))
+		return {
+			content: toolText("SURE finish was interrupted; no completion was accepted."),
+			details: { runId: active.record.runId, accepted: false } satisfies SureFinishDetails,
+		};
+	applyStatePatch(pi, ctx, active, gate.state_patch, "pre_finish_state");
+	if (!active.terminalizing) observeCoordinatedCheck(active, ctx, gate.checks ?? gate.check, gate.state_patch);
+	if (!gate.ok) {
+		const repair = gate.repair ?? gate.message ?? "Repair the Sure artifacts and call sure_finish again.";
+		active.record = runManager.updateRun(active.record, { lastRepair: repair }, "finish_repair", gate);
+		return {
+			content: toolText(repair),
+			details: {
+				runId: active.record.runId,
+				accepted: false,
+				repair,
+				diagnostics: gate.diagnostics,
+			} satisfies SureFinishDetails,
+		};
+	}
+
+	active.record = runManager.updateRun(
+		active.record,
+		{
+			status: finish.status,
+			manifestPath,
+			summary: finish.summary,
+			errorSummary: finish.error_summary,
+			artifacts: finish.artifacts,
+			finishedAt: new Date().toISOString(),
+			lastRepair: undefined,
+		},
+		"finished",
+		{ finish, manifestPath },
+	);
+	pi.appendEntry("sure.run", active.record);
+	const postFinish = await active.hooks.run("post_finish", {
+		run: active.record,
+		skill: active.skillPackage.manifest,
+		cwd: ctx.cwd,
+		packageDir: active.skillPackage.packageDir,
+		runDir: active.record.runDir,
+		args: active.record.args,
+		event: { finish, manifest, manifestPath },
+	});
+	applyStatePatch(pi, ctx, active, postFinish.state_patch, "post_finish_state");
+	if (!postFinish.ok) {
+		pi.appendEntry("sure.diagnostic", {
+			type: "warning",
+			message: postFinish.message ?? postFinish.repair ?? "Sure post-finish hook failed.",
+			path: active.skillPackage.manifestPath,
+		});
+	}
+	ctx.ui.setStatus(STATUS_KEY, undefined);
+	if (active.coordinator) ctx.setContextProjection?.(undefined);
+	if (active.coordinator && active.coordinator.state.status !== "stopped")
+		active.coordinator.stop(
+			finish.status === "success" ? "Run finished: success." : (finish.error_summary ?? finish.summary),
+		);
+	if (active.coordinator && finish.status !== "success" && !active.terminalizing) {
+		const report = buildSureFailureReport(active.record, active.coordinator, runManager.readState(active.record));
+		persistSureFailureReport(active.record, report);
+		pi.appendEntry("sure.failure_report", report);
+		if (ctx.mode === "print") ctx.ui.notify(renderSureFailureReport(report), "error");
+	}
+	active.record = runManager.updateRun(active.record, {}, "terminal_export");
+	if (active.coordinator)
+		pi.appendEntry(SESSION_OUTCOME_ENTRY, { exitCode: finish.status === "success" ? 0 : 1, summary: finish.summary });
+	clearActiveRun(pi, active, setActiveRun);
+	return {
+		content: toolText(`Sure run ${active.record.runId} finished with status ${finish.status}.`),
+		details: {
+			runId: active.record.runId,
+			status: finish.status,
+			accepted: true,
+		} satisfies SureFinishDetails,
+		terminate: true,
+	};
+}
+
+function pauseCoordinatedRun(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	active: ActiveRun,
+	result: SureDiagnosisCheckpoint,
+	setActiveRun: (run: ActiveRun | undefined) => void,
+): void {
+	const coordinator = active.coordinator!;
+	const manager = new SureRunManager(active.record.cwd);
+	active.record = manager.updateRun(
+		active.record,
+		{
+			status: "failed",
+			staleSince: new Date().toISOString(),
+			lastRepair: result.checkpoint,
+		},
+		"diagnosis_paused",
+		{ attemptId: coordinator.state.attempts.at(-1)?.id, checkpoint: result },
+	);
+	const report = buildSureFailureReport(active.record, coordinator, manager.readState(active.record));
+	persistSureFailureReport(active.record, report);
+	active.record = manager.updateRun(active.record, {}, "diagnosis_pause_export");
+	pi.appendEntry("sure.failure_report", report);
+	pi.appendEntry(SESSION_OUTCOME_ENTRY, {
+		exitCode: 1,
+		summary: "Diagnosis paused; no business stop was issued.",
+	});
+	ctx.ui.notify(renderSureFailureReport(report), "warning");
+	ctx.setContextProjection?.(undefined);
+	ctx.setExecutionHold?.(false);
+	clearActiveRun(pi, active, setActiveRun);
+}
+
+/** A receipt is an actual executor transcript message, never just a sender flag. */
+function pendingRepairReceipt(active: ActiveRun, ctx: ExtensionContext): boolean | undefined {
+	const pending = active.coordinator?.state.pendingRepair;
+	if (!pending) return true;
+	const prefix = `<sure_supervisor_repair id="${pending.id}"`;
+	const matches = (message: { role: string; content?: unknown }): boolean => {
+		if (message.role !== "user") return false;
+		if (typeof message.content === "string") return message.content.startsWith(prefix);
+		return (
+			Array.isArray(message.content) &&
+			message.content.some(
+				(block) => block?.type === "text" && typeof block.text === "string" && block.text.startsWith(prefix),
+			)
+		);
+	};
+	if (ctx.sessionManager.getBranch().some((entry) => entry.type === "message" && matches(entry.message))) return true;
+	if (!pending.deliveryStarted && !pending.delivered) return false;
+	if (!pending.receiverSessionFile || !existsSync(pending.receiverSessionFile)) return undefined;
+	try {
+		const entries = readFileSync(pending.receiverSessionFile, "utf8")
+			.split("\n")
+			.filter((line) => line.trim())
+			.map(
+				(line) => JSON.parse(line) as { type: string; message?: { role: string; content?: unknown }; cwd?: string },
+			);
+		if (entries[0]?.type !== "session" || entries[0].cwd !== active.record.cwd) return undefined;
+		return entries.some((entry) => entry.type === "message" && entry.message && matches(entry.message));
+	} catch {
+		return undefined;
+	}
+}
+
+async function deliverPendingRepair(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	active: ActiveRun,
+	setActiveRun: (run: ActiveRun | undefined) => void,
+): Promise<boolean> {
+	const coordinator = active.coordinator!;
+	if (active.shuttingDown || coordinator.isStopped || ctx.signal?.aborted) return false;
+	const pending = coordinator.state.pendingRepair!;
+	active.ownership?.assertCurrent();
+	const receipt = pendingRepairReceipt(active, ctx);
+	if (receipt === true) {
+		pending.delivered = true;
+		coordinator.save();
+		ctx.setExecutionHold?.(false);
+		return false;
+	}
+	if (receipt === undefined) {
+		coordinator.beginDiagnosis();
+		const checkpoint: SureDiagnosisCheckpoint = {
+			runId: active.record.runId,
+			unitId: coordinator.state.unitId,
+			evidenceVersion: coordinator.state.evidenceVersion,
+			decision: "checkpoint",
+			checkpoint: "handoff_delivery_unconfirmed: executor receipt cannot be established; no blind replay.",
+			automatic: false,
+			facts: [],
+			hypotheses: [],
+			unknowns: ["Executor receipt is unconfirmed."],
+			nextActions: [],
+			evidenceReferences: [],
+			nextReads: [],
+			candidateRange: null,
+			supportingEvidence: [],
+			opposingEvidence: [],
+		};
+		coordinator.state.attempts.at(-1)!.checkpoint = checkpoint;
+		coordinator.save();
+		pauseCoordinatedRun(pi, ctx, active, checkpoint, setActiveRun);
+		return true;
+	}
+	syncCoordinatedMessages(pi, ctx, active, true);
+	pending.deliveryStarted = true;
+	pending.receiverSessionFile = ctx.sessionManager.getSessionFile();
+	pending.delivered = false;
+	coordinator.save();
+	ctx.setExecutionHold?.(false);
+	active.lastAgentMessages = undefined;
+	await pi.sendUserMessage(
+		`<sure_supervisor_repair id="${pending.id}" run_id="${active.record.runId}" unit="${pending.result.unitId}">\n${pending.result.repair}\nSuggested focusPaths (not a write allowlist): ${JSON.stringify(pending.result.focusPaths ?? [])}. Preserve original permissions, user constraints and the original gate. Choose supporting reads, probes and corrections. Independent errors each have one local correction. Investigate newly discovered related objects within the complete goal. Return an actual failed recheck of the original condition, a changed goal, or unresolved dependency counterevidence for reassessment.\n</sure_supervisor_repair>`,
+	);
+	if (
+		!active.shuttingDown &&
+		!coordinator.isStopped &&
+		!ctx.signal?.aborted &&
+		coordinator.state.pendingRepair?.id === pending.id &&
+		pendingRepairReceipt(active, ctx) === true
+	) {
+		try {
+			active.ownership?.assertCurrent();
+		} catch {
+			return true;
+		}
+		pending.delivered = true;
+		coordinator.save();
+	}
+	return true;
+}
+
+async function settleCoordinatedRun(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	active: ActiveRun,
+	setActiveRun: (run: ActiveRun | undefined) => void,
+): Promise<void> {
+	const coordinator = active.coordinator;
+	if (!coordinator || active.shuttingDown || active.terminalizing) return;
+	active.ownership?.assertCurrent();
+	ctx.setExecutionHold?.(true);
+	await Promise.all([...(active.toolInvocations?.values() ?? [])].map((call) => call.settled));
+	await active.resultQueue;
+	if (active.shuttingDown || active.terminalizing) return;
+	const transcript = ctx.sessionManager
+		.getBranch()
+		.flatMap((entry) => (entry.type === "message" ? [{ message: entry.message, id: entry.id }] : []));
+	syncSureUserContext(
+		coordinator,
+		transcript.map(({ message }) => message),
+	);
+	captureSureExecutorProgress(
+		active.record,
+		coordinator.state.unitId,
+		transcript.map(({ message }) => message),
+		new SureRunManager(active.record.cwd).readState(active.record)?.checkpoint,
+		ctx.sessionManager.getSessionFile(),
+		new Map(transcript.map(({ message, id }) => [message, id])),
+		coordinator.state.stageStartedAt,
+		new Map(
+			loadSureDiagnosticIndex(coordinator).actions.flatMap((action) =>
+				action.unitId ? [[action.toolCallId, action.unitId] as const] : [],
+			),
+		),
+	);
+	const scope = coordinatedScope(active);
+	coordinator.barrier(scope);
+	if (ctx.signal?.aborted) coordinator.stop("User cancelled execution.", true);
+	while (!coordinator.isStopped) {
+		ctx.ui.notify(`SURE diagnosing unit ${coordinator.state.unitId}; executor tools have settled.`, "info");
+		active.diagnosis = diagnoseSureRun(
+			coordinator,
+			ctx,
+			scope,
+			active.skillPackage.manifest.coordination?.stages.find((stage) => stage.id === coordinator.state.unitId),
+			active.skillPackage,
+		);
+		const result = await active.diagnosis.finally(() => {
+			active.diagnosis = undefined;
+		});
+		if (active.shuttingDown) return;
+		if (ctx.signal?.aborted) coordinator.stop("User cancelled diagnosis.", true);
+		if (coordinator.isStopped) break;
+		if (result.decision === "checkpoint") {
+			if (result.automatic) continue;
+			pauseCoordinatedRun(pi, ctx, active, result, setActiveRun);
+			return;
+		} else {
+			coordinator.barrier(scope);
+			if (coordinator.isStopped) break;
+			if (!coordinator.acceptDiagnosis(result)) {
+				if (coordinator.isStopped) break;
+				coordinator.state.status = "diagnosing";
+				coordinator.state.yieldReason =
+					"Diagnosis became stale while evidence changed; investigate the new version.";
+				coordinator.save();
+				continue;
+			}
+		}
+		break;
+	}
+	const pending = coordinator.state.pendingRepair;
+	if (coordinator.state.status === "executing" && pending) {
+		await deliverPendingRepair(pi, ctx, active, setActiveRun);
+		return;
+	}
+	if (active.terminalizing || active.shuttingDown) return;
+	active.terminalizing = true;
+	const manager = new SureRunManager(active.record.cwd);
+	const primaryError =
+		coordinator.state.lastFailure?.summary ??
+		coordinator.state.originalFailure?.summary ??
+		(coordinator.state.lastCheck &&
+		coordinator.state.lastCheck.outcome !== "pending" &&
+		coordinator.state.lastCheck.outcome !== "passed"
+			? coordinator.state.lastCheck.summary
+			: undefined) ??
+		active.record.lastRepair ??
+		coordinator.state.stopReason ??
+		"Execution stopped without a valid completion.";
+	active.record = manager.updateRun(
+		active.record,
+		{ errorSummary: primaryError, lastRepair: primaryError },
+		"coordination_stopped",
+		{ reason: coordinator.state.stopReason },
+	);
+	const context = {
+		run: active.record,
+		skill: active.skillPackage.manifest,
+		cwd: ctx.cwd,
+		packageDir: active.skillPackage.packageDir,
+		runDir: active.record.runDir,
+		args: active.record.args,
+		event: { reason: coordinator.state.stopReason },
+	};
+	const onError = await active.hooks.run("on_error", context);
+	applyStatePatch(pi, ctx, active, onError.state_patch, "coordination_error_state");
+	active.record = manager.updateRun(
+		active.record,
+		{
+			status: coordinator.state.cancelled ? "cancelled" : "failed",
+			errorSummary: primaryError,
+			lastRepair: primaryError,
+			finishedAt: new Date().toISOString(),
+		},
+		"coordination_terminal",
+	);
+	coordinator.save();
+	const report = buildSureFailureReport(active.record, coordinator, manager.readState(active.record));
+	persistSureFailureReport(active.record, report);
+	pi.appendEntry("sure.failure_report", report);
+	pi.appendEntry(SESSION_OUTCOME_ENTRY, {
+		exitCode: coordinator.state.cancelled ? 130 : 1,
+		summary: report.stopReason,
+	});
+	if (ctx.mode === "print") ctx.ui.notify(renderSureFailureReport(report), "error");
+	active.record = manager.updateRun(active.record, {}, "terminal_export");
+	pi.appendEntry("sure.run", active.record);
+	ctx.ui.setStatus(STATUS_KEY, undefined);
+	// A shutdown may settle tool results before agent-core checks the turn hold.
+	// Keep it in place until agent_settled; clearing it here could start another request.
+	if (!ctx.isIdle()) return;
+	ctx.setContextProjection?.(undefined);
+	ctx.setExecutionHold?.(false);
+	clearActiveRun(pi, active, setActiveRun);
+}
+
 async function startRun(
 	pi: ExtensionAPI,
 	ctx: ExtensionCommandContext,
@@ -492,42 +1240,65 @@ async function startRun(
 	const record = runManager.createRun(skillPackage, args, outputDir.dir);
 	const active: ActiveRun = {
 		record,
+		ownership: skillPackage.manifest.coordination ? acquireSureRunOwnership(record.runDir) : undefined,
 		skillPackage,
 		hooks: new SureHookRunner(skillPackage),
 		previousActiveTools: pi.getActiveTools(),
 	};
 	setActiveRun(active);
-
-	const preStart = await active.hooks.run("pre_start", {
-		run: active.record,
-		skill: skillPackage.manifest,
-		cwd: ctx.cwd,
-		packageDir: skillPackage.packageDir,
-		runDir: active.record.runDir,
-		args,
-	});
-	applyStatePatch(pi, ctx, active, preStart.state_patch, "pre_start_state");
-	if (!preStart.ok) {
-		active.record = runManager.updateRun(
-			active.record,
-			{ status: "failed", finishedAt: new Date().toISOString(), lastRepair: preStart.repair ?? preStart.message },
-			"pre_start_repair",
-			preStart,
-		);
-		ctx.ui.notify(preStart.repair ?? preStart.message ?? "Sure pre-start gate rejected the run.", "error");
-		pi.appendEntry("sure.run", active.record);
-		pi.setActiveTools(active.previousActiveTools);
-		setActiveRun(undefined);
-		return;
-	}
-
-	active.record = runManager.setStatus(active.record, "running", "started");
-	pi.setActiveTools(activeToolNames(active));
-	setRunStatusText(ctx, active.record, runManager.readState(active.record));
-	pi.appendEntry("sure.run", active.record);
 	try {
+		const initialStage = skillPackage.manifest.coordination?.stages[0];
+		if (initialStage)
+			active.coordinator = new SureCoordinator(
+				record,
+				initialStage.id,
+				[...initialStage.snapshotPaths, ...surePromptPaths(skillPackage, initialStage.id)],
+				skillPackage.manifest.coordination?.budgets,
+				active.ownership?.assertCurrent,
+			);
+
+		const preStart = await active.hooks.run("pre_start", {
+			run: active.record,
+			skill: skillPackage.manifest,
+			cwd: ctx.cwd,
+			packageDir: skillPackage.packageDir,
+			runDir: active.record.runDir,
+			args,
+		});
+		applyStatePatch(pi, ctx, active, preStart.state_patch, "pre_start_state");
+		if (!preStart.ok) {
+			if (skillPackage.manifest.coordination) {
+				failCoordinatedEntry(
+					pi,
+					ctx,
+					active,
+					preStart.repair ?? preStart.message ?? "Sure pre-start gate rejected the run.",
+					setActiveRun,
+				);
+				return;
+			}
+			active.record = runManager.updateRun(
+				active.record,
+				{ status: "failed", finishedAt: new Date().toISOString(), lastRepair: preStart.repair ?? preStart.message },
+				"pre_start_repair",
+				preStart,
+			);
+			ctx.ui.notify(preStart.repair ?? preStart.message ?? "Sure pre-start gate rejected the run.", "error");
+			pi.appendEntry("sure.run", active.record);
+			pi.setActiveTools(active.previousActiveTools);
+			setActiveRun(undefined);
+			return;
+		}
+
+		active.record = runManager.setStatus(active.record, "running", "started");
+		pi.setActiveTools(activeToolNames(active));
+		setRunStatusText(ctx, active.record, runManager.readState(active.record));
+		pi.appendEntry("sure.run", active.record);
+		installCoordinatedContext(pi, ctx, active, preStart.check?.inputPaths);
+		observeCoordinatedCheck(active, ctx, preStart.checks ?? preStart.check);
 		await pi.sendUserMessage(buildInvocationPrompt(skillPackage, active.record));
 	} catch (error) {
+		active.ownership?.assertCurrent();
 		const message = error instanceof Error ? error.message : String(error);
 		active.record = runManager.updateRun(
 			active.record,
@@ -549,9 +1320,14 @@ async function startRun(
 			event: { reason: "agent_error", message },
 		});
 		applyStatePatch(pi, ctx, active, onError.state_patch, "on_error_state");
+		if (skillPackage.manifest.coordination) {
+			failCoordinatedEntry(pi, ctx, active, `Sure run failed to start or continue: ${message}`, setActiveRun);
+			return;
+		}
 		ctx.ui.setStatus(STATUS_KEY, undefined);
 		pi.appendEntry("sure.run", active.record);
 		clearActiveRun(pi, active, setActiveRun);
+		ctx.setContextProjection?.(undefined);
 		throw error;
 	}
 }
@@ -618,8 +1394,16 @@ async function resumeRun(
 		return;
 	}
 
+	let ownership: SureRunOwnership | undefined;
+	try {
+		if (skillPackage.manifest.coordination) ownership = acquireSureRunOwnership(resumed.record.runDir);
+	} catch (error) {
+		ctx.ui.notify(error instanceof Error ? error.message : String(error), "warning");
+		return;
+	}
 	const active: ActiveRun = {
 		record: resumed.record,
+		ownership,
 		skillPackage,
 		hooks: new SureHookRunner(skillPackage),
 		previousActiveTools: pi.getActiveTools(),
@@ -632,9 +1416,68 @@ async function resumeRun(
 	setRunStatusText(ctx, active.record, resumed.state);
 	pi.appendEntry("sure.run", active.record);
 	try {
+		installCoordinatedContext(pi, ctx, active);
+		if (active.coordinator) {
+			const pausedAttempt = active.coordinator.state.attempts.at(-1);
+			if (pausedAttempt?.checkpoint && !pausedAttempt.checkpoint.automatic) {
+				pausedAttempt.protocolErrors = 0;
+				pausedAttempt.protocolFeedback = false;
+				active.coordinator.save();
+			}
+			const previous = readSureSnapshot(active.record, active.coordinator.state.latestSnapshot!);
+			const current = active.coordinator.barrier(coordinatedScope(active));
+			const identity = ({ path, status, sha256, size, modifiedAt }: (typeof previous.files)[number]) =>
+				JSON.stringify({ path, status, sha256, size, modifiedAt: sha256 ? undefined : modifiedAt });
+			const priorFiles = new Map(previous.files.map((file) => [file.path, file]));
+			const currentFiles = new Map(current.files.map((file) => [file.path, file]));
+			const changed =
+				previous.files.some(
+					(file) =>
+						!file.path.startsWith("run:evidence/tools/") &&
+						identity(file) !== (currentFiles.has(file.path) ? identity(currentFiles.get(file.path)!) : undefined),
+				) ||
+				current.files.some(
+					(file) =>
+						!file.path.startsWith("run:evidence/tools/") &&
+						!priorFiles.has(file.path) &&
+						previous.checkScope.some(
+							(scope) => file.path === scope || file.path.startsWith(scope.endsWith(":") ? scope : `${scope}/`),
+						),
+				);
+			const pending = active.coordinator.state.pendingRepair;
+			if (pending && changed) {
+				active.coordinator.invalidateRepair("Files changed before resume; the previous repair is stale.");
+				if (active.coordinator.state.status === "executing") active.coordinator.state.status = "yielding";
+				active.coordinator.save();
+			}
+		}
+		if (active.coordinator?.resumeBlocker) {
+			active.coordinator.stop(active.coordinator.resumeBlocker);
+			await settleCoordinatedRun(pi, ctx, active, setActiveRun);
+			return;
+		}
+		if (
+			active.coordinator &&
+			(active.coordinator.state.status === "yielding" || active.coordinator.state.status === "diagnosing")
+		) {
+			await settleCoordinatedRun(pi, ctx, active, setActiveRun);
+			return;
+		}
+		if (active.coordinator) {
+			active.coordinator.state.status = "executing";
+			if (active.coordinator.state.pendingRepair && (await deliverPendingRepair(pi, ctx, active, setActiveRun)))
+				return;
+			active.coordinator.save();
+			ctx.setExecutionHold?.(false);
+		}
 		await pi.sendUserMessage(buildResumePrompt(skillPackage, active.record, resumed.state));
 	} catch (error) {
+		active.ownership?.assertCurrent();
 		const message = error instanceof Error ? error.message : String(error);
+		if (skillPackage.manifest.coordination) {
+			failCoordinatedEntry(pi, ctx, active, `Sure run failed to resume: ${message}`, setActiveRun);
+			return;
+		}
 		active.record = runManager.updateRun(
 			active.record,
 			{
@@ -648,8 +1491,43 @@ async function resumeRun(
 		ctx.ui.setStatus(STATUS_KEY, undefined);
 		pi.appendEntry("sure.run", active.record);
 		clearActiveRun(pi, active, setActiveRun);
+		ctx.setContextProjection?.(undefined);
 		throw error;
 	}
+}
+
+/** Entry failures use the same report without starting either model or changing a gate. */
+function failCoordinatedEntry(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	active: ActiveRun,
+	message: string,
+	setActiveRun: (run: ActiveRun | undefined) => void,
+): void {
+	const manager = new SureRunManager(active.record.cwd);
+	active.coordinator?.stop(message);
+	active.record = manager.updateRun(
+		active.record,
+		{
+			status: "failed",
+			finishedAt: new Date().toISOString(),
+			errorSummary: active.record.errorSummary ?? message,
+			lastRepair: message,
+		},
+		"entry_failed",
+		{ message },
+	);
+	const report = buildSureFailureReport(active.record, active.coordinator, manager.readState(active.record));
+	persistSureFailureReport(active.record, report);
+	pi.appendEntry("sure.failure_report", report);
+	pi.appendEntry(SESSION_OUTCOME_ENTRY, { exitCode: 1, summary: message });
+	active.record = manager.updateRun(active.record, {}, "terminal_export");
+	pi.appendEntry("sure.run", active.record);
+	ctx.ui.notify(ctx.mode === "print" ? renderSureFailureReport(report) : message, "error");
+	ctx.ui.setStatus(STATUS_KEY, undefined);
+	ctx.setContextProjection?.(undefined);
+	ctx.setExecutionHold?.(false);
+	clearActiveRun(pi, active, setActiveRun);
 }
 
 function clearActiveRun(
@@ -660,6 +1538,7 @@ function clearActiveRun(
 	if (!active) {
 		return;
 	}
+	active.ownership?.release();
 	pi.setActiveTools(
 		pi.getActiveTools().filter((toolName) => toolName !== FINISH_TOOL_NAME && toolName !== UPDATE_STATE_TOOL_NAME),
 	);
@@ -702,6 +1581,9 @@ export async function switchToInitializedModel(
 
 export function createSureExtension(): ExtensionFactory {
 	return (pi: ExtensionAPI) => {
+		pi.registerEntryRenderer<SureFailureReport>("sure.failure_report", (entry, options) =>
+			entry.data ? new Text(renderSureFailureReport(entry.data, options.expanded), 0, 0) : undefined,
+		);
 		let activeRun: ActiveRun | undefined;
 
 		const setActiveRun = (run: ActiveRun | undefined) => {
@@ -768,6 +1650,21 @@ export function createSureExtension(): ExtensionFactory {
 							isError: true,
 						};
 					}
+					if (params.repair_verification) {
+						try {
+							if (!active.coordinator)
+								throw new Error("Repair verification requires an opted-in coordination run.");
+							const { repair_id, check_version, relation } = params.repair_verification;
+							active.coordinator.verifyRepair(repair_id, check_version, relation);
+							if (active.coordinator.state.status !== "executing") ctx.setExecutionHold?.(true);
+						} catch (error) {
+							return {
+								content: toolText(error instanceof Error ? error.message : String(error)),
+								details: { accepted: false } satisfies SureUpdateStateDetails,
+								isError: true,
+							};
+						}
+					}
 					const result = applyStatePatch(pi, ctx, active, params, "state_update");
 					if (!result.ok) {
 						return {
@@ -814,119 +1711,7 @@ export function createSureExtension(): ExtensionFactory {
 						};
 					}
 
-					const finish = params as SureFinishParams;
-					const runManager = new SureRunManager(active.record.cwd);
-					const manifestPath = runManager.resolveRunPath(active.record, finish.manifest_path);
-					if (!manifestPath || !existsSync(manifestPath)) {
-						const repair = `Create the final manifest at ${finish.manifest_path} inside the project or run workspace, then call ${FINISH_TOOL_NAME} again.`;
-						active.record = runManager.updateRun(active.record, { lastRepair: repair }, "finish_repair", {
-							repair,
-						});
-						return {
-							content: toolText(repair),
-							details: { runId: active.record.runId, accepted: false, repair } satisfies SureFinishDetails,
-						};
-					}
-
-					let manifest: unknown;
-					try {
-						manifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
-					} catch (error) {
-						const repair = `Final manifest must be valid JSON: ${error instanceof Error ? error.message : String(error)}`;
-						active.record = runManager.updateRun(active.record, { lastRepair: repair }, "finish_repair", {
-							repair,
-						});
-						return {
-							content: toolText(repair),
-							details: { runId: active.record.runId, accepted: false, repair } satisfies SureFinishDetails,
-						};
-					}
-
-					const envelopeError = validateManifestEnvelope(
-						manifest,
-						active.record,
-						finish,
-						runManager,
-						active.skillPackage,
-					);
-					if (envelopeError) {
-						const repair = `${envelopeError} Repair the manifest and call ${FINISH_TOOL_NAME} again.`;
-						active.record = runManager.updateRun(active.record, { lastRepair: repair }, "finish_repair", {
-							repair,
-						});
-						return {
-							content: toolText(repair),
-							details: { runId: active.record.runId, accepted: false, repair } satisfies SureFinishDetails,
-						};
-					}
-
-					const gate = await active.hooks.run("pre_finish", {
-						run: active.record,
-						skill: active.skillPackage.manifest,
-						cwd: ctx.cwd,
-						packageDir: active.skillPackage.packageDir,
-						runDir: active.record.runDir,
-						args: active.record.args,
-						event: { finish, manifest, manifestPath },
-					});
-					applyStatePatch(pi, ctx, active, gate.state_patch, "pre_finish_state");
-					if (!gate.ok) {
-						const repair = gate.repair ?? gate.message ?? "Repair the Sure artifacts and call sure_finish again.";
-						active.record = runManager.updateRun(active.record, { lastRepair: repair }, "finish_repair", gate);
-						return {
-							content: toolText(repair),
-							details: {
-								runId: active.record.runId,
-								accepted: false,
-								repair,
-								diagnostics: gate.diagnostics,
-							} satisfies SureFinishDetails,
-						};
-					}
-
-					active.record = runManager.updateRun(
-						active.record,
-						{
-							status: finish.status,
-							manifestPath,
-							summary: finish.summary,
-							errorSummary: finish.error_summary,
-							artifacts: finish.artifacts,
-							finishedAt: new Date().toISOString(),
-							lastRepair: undefined,
-						},
-						"finished",
-						{ finish, manifestPath },
-					);
-					pi.appendEntry("sure.run", active.record);
-					const postFinish = await active.hooks.run("post_finish", {
-						run: active.record,
-						skill: active.skillPackage.manifest,
-						cwd: ctx.cwd,
-						packageDir: active.skillPackage.packageDir,
-						runDir: active.record.runDir,
-						args: active.record.args,
-						event: { finish, manifest, manifestPath },
-					});
-					applyStatePatch(pi, ctx, active, postFinish.state_patch, "post_finish_state");
-					if (!postFinish.ok) {
-						pi.appendEntry("sure.diagnostic", {
-							type: "warning",
-							message: postFinish.message ?? postFinish.repair ?? "Sure post-finish hook failed.",
-							path: active.skillPackage.manifestPath,
-						});
-					}
-					ctx.ui.setStatus(STATUS_KEY, undefined);
-					clearActiveRun(pi, active, setActiveRun);
-					return {
-						content: toolText(`Sure run ${active.record.runId} finished with status ${finish.status}.`),
-						details: {
-							runId: active.record.runId,
-							status: finish.status,
-							accepted: true,
-						} satisfies SureFinishDetails,
-						terminate: true,
-					};
+					return finishActiveRun(pi, ctx, active, params as SureFinishParams, setActiveRun);
 				},
 			}),
 		);
@@ -995,8 +1780,124 @@ export function createSureExtension(): ExtensionFactory {
 			});
 		}
 
+		pi.on("turn_start", (event) => {
+			if (activeRun) activeRun.batchId = `${event.timestamp}:${event.turnIndex}`;
+		});
+
+		pi.on("turn_end", (event, ctx) => {
+			const active = activeRun;
+			if (!active?.coordinator || active.coordinator.state.status !== "executing") return;
+			const batches = new Map<string, { unitId: string; batchId: string }>();
+			for (const result of event.toolResults) {
+				const identity = active.toolInvocations?.get(result.toolCallId)?.identity;
+				if (!identity?.batchId) continue;
+				batches.set(`${identity.unitId}\0${identity.batchId}`, {
+					unitId: identity.unitId,
+					batchId: identity.batchId,
+				});
+			}
+			for (const batch of batches.values()) active.coordinator.recordToolBatch(batch.unitId, batch.batchId);
+			if (active.coordinator.state.status !== "executing") ctx.setExecutionHold?.(true);
+			else syncCoordinatedMessages(pi, ctx, active);
+		});
+
+		pi.on("session_before_compact", (_event, ctx) => {
+			const active = activeRun;
+			if (!active?.coordinator) return;
+			active.compactionTrim = planSureContextTrim(
+				ctx.sessionManager.buildContextEntries().flatMap(sessionEntryToContextMessages),
+				active.coordinator.state.stageStartedAt ?? 0,
+				active.coordinator.state,
+				loadSureCheckRecords(active.coordinator),
+			);
+		});
+		pi.on("session_compact", (event, ctx) => {
+			const active = activeRun;
+			if (
+				!active?.coordinator ||
+				active.coordinator.isStopped ||
+				active.shuttingDown ||
+				(ctx.signal?.aborted && event.reason !== "manual")
+			)
+				return;
+			active.ownership?.assertCurrent();
+			active.trimmedCalls = [...new Set([...(active.trimmedCalls ?? []), ...(active.compactionTrim ?? [])])];
+			active.compactionTrim = undefined;
+			pi.appendEntry("sure.context.trim", { runId: active.record.runId, calls: active.trimmedCalls });
+			syncCoordinatedMessages(pi, ctx, active, true);
+		});
+
+		// agent-core emits this before validation/preflight, including calls it may skip.
+		// Only tool_result below proves execution; tool_execution_end covers skipped calls.
+		pi.on("tool_execution_start", (event, ctx) => {
+			const active = activeRun;
+			if (!active?.coordinator || event.toolName === FINISH_TOOL_NAME || event.toolName === UPDATE_STATE_TOOL_NAME)
+				return;
+			active.toolInvocations ??= new Map();
+			if (!active.toolInvocations.has(event.toolCallId)) {
+				let complete!: () => void;
+				const settled = new Promise<void>((resolve) => {
+					complete = resolve;
+				});
+				active.toolInvocations.set(event.toolCallId, {
+					settled,
+					complete,
+					identity: {
+						unitId: sureCurrentUnit(
+							active.skillPackage,
+							new SureRunManager(active.record.cwd).readState(active.record),
+						),
+						batchId: active.batchId,
+						requestedAt: new Date().toISOString(),
+						order: active.toolInvocations.size,
+						cwd: ctx.cwd,
+						toolName: event.toolName,
+						input: event.args,
+					},
+				});
+			}
+		});
+
+		pi.on("tool_execution_end", (event) => {
+			const active = activeRun;
+			const call = active?.toolInvocations?.get(event.toolCallId);
+			if (!active?.coordinator || !call) return;
+			try {
+				active.ownership?.assertCurrent();
+				const path = join(active.record.runDir, "evidence/tools", `${sureHash(event.toolCallId)}.json`);
+				if (existsSync(path)) return;
+				const result = event.result as { content: SureToolContent[] };
+				writeSureJson(path, {
+					...call.identity,
+					toolCallId: event.toolCallId,
+					execution: "skipped",
+					completedAt: new Date().toISOString(),
+					isError: event.isError,
+					content: result.content.filter((block) => block.type === "text"),
+				});
+			} finally {
+				call.complete();
+			}
+		});
+
 		pi.on("tool_call", async (event, ctx) => {
 			const active = activeRun;
+			active?.ownership?.assertCurrent();
+			if (active?.coordinator && active.coordinator.state.status === "executing") {
+				const display = new SureRunManager(active.record.cwd).readState(active.record);
+				const unit = sureCurrentUnit(active.skillPackage, display);
+				if (display?.phase?.id === unit && display.phase.label)
+					active.coordinator.state.unitLabel = display.phase.label;
+				active.coordinator.recordAction(unit, event.toolName, event.input);
+				if (active.coordinator.state.status !== "executing") ctx.setExecutionHold?.(true);
+			}
+			if (active?.coordinator && active.coordinator.state.status !== "executing") {
+				return {
+					block: true,
+					reason: "SURE execution is held for diagnosis; this unstarted call was skipped.",
+					terminate: true,
+				};
+			}
 			if (!active || event.toolName === FINISH_TOOL_NAME || event.toolName === UPDATE_STATE_TOOL_NAME) {
 				return undefined;
 			}
@@ -1016,6 +1917,43 @@ export function createSureExtension(): ExtensionFactory {
 				event,
 			});
 			applyStatePatch(pi, ctx, active, gate.state_patch, "pre_tool_call_state");
+			observeCoordinatedCheck(
+				active,
+				ctx,
+				(gate.checks?.length
+					? gate.checks
+					: gate.check
+						? [gate.check]
+						: !gate.ok
+							? [
+									{
+										unitId: active.coordinator?.state.unitId ?? "unknown",
+										outcome: "blocked" as const,
+										checker: "pre_tool_call",
+										summary: gate.message ?? gate.repair ?? "Tool preflight rejected the call.",
+										repair: gate.repair,
+										inputPaths: [],
+										artifactPaths: [],
+									},
+								]
+							: []
+				).map((check) => ({
+					...check,
+					action: {
+						toolCallId: event.toolCallId,
+						toolName: event.toolName,
+						path: `run:evidence/tools/${sureHash(event.toolCallId)}.json`,
+						batchId: active.toolInvocations?.get(event.toolCallId)?.identity.batchId,
+					},
+				})),
+				gate.state_patch,
+			);
+			if (active.coordinator && active.coordinator.state.status !== "executing")
+				return {
+					block: true,
+					reason: gate.repair ?? gate.message ?? "SURE held this call for diagnosis.",
+					terminate: true,
+				};
 			if (!gate.ok) {
 				const repair = gate.repair ?? gate.message ?? "Repair the tool call and retry.";
 				active.record = runManager.updateRun(active.record, { lastRepair: repair }, "tool_call_repair", gate);
@@ -1035,32 +1973,105 @@ export function createSureExtension(): ExtensionFactory {
 			if (!active) {
 				return undefined;
 			}
-			const runManager = new SureRunManager(active.record.cwd);
-			active.record = runManager.updateRun(active.record, {}, "tool_result", {
-				toolName: event.toolName,
-				toolCallId: event.toolCallId,
-				isError: event.isError,
-			});
-			const gate = await active.hooks.run("post_tool_result", {
-				run: active.record,
-				skill: active.skillPackage.manifest,
-				cwd: ctx.cwd,
-				packageDir: active.skillPackage.packageDir,
-				runDir: active.record.runDir,
-				args: active.record.args,
-				event,
-			});
-			applyStatePatch(pi, ctx, active, gate.state_patch, "post_tool_result_state");
-			if (!gate.ok) {
-				const repair = gate.repair ?? gate.message ?? "Repair the tool result issue and retry.";
-				active.record = runManager.updateRun(active.record, { lastRepair: repair }, "tool_result_repair", gate);
-				return {
-					content: toolText(repair),
-					details: { repair, diagnostics: gate.diagnostics },
-					isError: true,
-				};
+			const previousResult = active.coordinator ? (active.resultQueue ?? Promise.resolve()) : Promise.resolve();
+			let release: (() => void) | undefined;
+			if (active.coordinator)
+				active.resultQueue = new Promise<void>((resolve) => {
+					release = resolve;
+				});
+			await previousResult;
+			try {
+				active.ownership?.assertCurrent();
+				const invocation = active.toolInvocations?.get(event.toolCallId)?.identity;
+				const actionPath = join(active.record.runDir, "evidence/tools", `${sureHash(event.toolCallId)}.json`);
+				if (active.coordinator && existsSync(actionPath)) return undefined;
+				const action =
+					active.coordinator && invocation
+						? {
+								toolCallId: event.toolCallId,
+								toolName: event.toolName,
+								path: `run:evidence/tools/${sureHash(event.toolCallId)}.json`,
+								batchId: invocation.batchId,
+							}
+						: undefined;
+				if (action)
+					writeSureJson(actionPath, {
+						...invocation,
+						toolCallId: event.toolCallId,
+						input: event.input,
+						completedAt: new Date().toISOString(),
+						execution: "returned",
+						duringHold: active.coordinator?.state.status !== "executing",
+						content: event.content.filter((block) => block.type === "text"),
+						isError: event.isError,
+					});
+				const runManager = new SureRunManager(active.record.cwd);
+				active.record = runManager.updateRun(active.record, {}, "tool_result", {
+					toolName: event.toolName,
+					toolCallId: event.toolCallId,
+					isError: event.isError,
+					content: active.coordinator
+						? event.content
+								.filter((block) => block.type === "text")
+								.map((block) => block.text)
+								.join("\n")
+								.slice(-16_000)
+						: undefined,
+				});
+				if (active.coordinator && active.coordinator.state.status !== "executing") return undefined;
+				if (
+					active.coordinator &&
+					Object.keys(active.coordinator.state.observedToolChecks ?? {}).some(
+						(key) => JSON.parse(key)[1] === event.toolCallId,
+					)
+				)
+					return undefined;
+				const gate = await active.hooks.run("post_tool_result", {
+					run: active.record,
+					skill: active.skillPackage.manifest,
+					cwd: ctx.cwd,
+					packageDir: active.skillPackage.packageDir,
+					runDir: active.record.runDir,
+					args: active.record.args,
+					event,
+				});
+				// Cancellation or new constraints can arrive while a previously started hook awaits.
+				if (active.coordinator && active.coordinator.state.status !== "executing") return undefined;
+				applyStatePatch(pi, ctx, active, gate.state_patch, "post_tool_result_state");
+				observeCoordinatedCheck(
+					active,
+					ctx,
+					(gate.checks ?? (gate.check ? [gate.check] : [])).map((check) =>
+						check.failureKind === "tool"
+							? {
+									...check,
+									action,
+									checker: `tool:${event.toolName}`,
+									summary: `${check.summary}\n${event.content
+										.filter((block) => block.type === "text")
+										.map((block) => block.text)
+										.join("\n")
+										.slice(-2000)}`,
+								}
+							: { ...check, action },
+					),
+					gate.state_patch,
+				);
+				if (!gate.ok) {
+					const repair = gate.repair ?? gate.message ?? "Repair the tool result issue and retry.";
+					active.record = runManager.updateRun(active.record, { lastRepair: repair }, "tool_result_repair", gate);
+					return {
+						content: active.coordinator
+							? [...event.content, ...toolText(`SURE gate feedback: ${repair}`)]
+							: toolText(repair),
+						details: { repair, diagnostics: gate.diagnostics },
+						isError: true,
+					};
+				}
+				return undefined;
+			} finally {
+				release?.();
 			}
-			return undefined;
 		});
 
 		pi.on("agent_end", async (event) => {
@@ -1076,16 +2087,77 @@ export function createSureExtension(): ExtensionFactory {
 			active.lastAgentMessages = event.messages;
 		});
 
+		pi.on("input", (event) => {
+			if (activeRun?.coordinator && event.source !== "extension")
+				syncSureUserContext(
+					activeRun.coordinator,
+					[
+						{
+							role: "user",
+							timestamp: Date.now(),
+							content: [{ type: "text", text: event.text }, ...(event.images ?? [])],
+						},
+					],
+					true,
+				);
+		});
+
+		pi.on("message_end", (event, ctx) => {
+			if (activeRun?.coordinator && event.message.role === "user") {
+				syncSureUserContext(activeRun.coordinator, [event.message]);
+				if (activeRun.coordinator.state.status !== "executing") ctx.setExecutionHold?.(true);
+			}
+		});
+
 		pi.on("agent_settled", async (_event, ctx) => {
 			const active = activeRun;
 			if (!active) {
 				return;
 			}
 			if (active.record.status !== "running") {
+				if (active.coordinator && active.terminalizing) {
+					ctx.setContextProjection?.(undefined);
+					ctx.setExecutionHold?.(false);
+					clearActiveRun(pi, active, setActiveRun);
+				}
 				return;
 			}
+			if (active.shuttingDown) return;
 			const messages = active.lastAgentMessages;
+			const last = messages ? [...messages].reverse().find((message) => message.role === "assistant") : undefined;
+			if (
+				active.coordinator?.state.status === "executing" &&
+				last?.role === "assistant" &&
+				last.stopReason === "error"
+			) {
+				observeCoordinatedCheck(
+					active,
+					ctx,
+					{
+						unitId: sureCurrentUnit(
+							active.skillPackage,
+							new SureRunManager(active.record.cwd).readState(active.record),
+						),
+						outcome: "blocked",
+						failureKind: "execution",
+						summary: last.errorMessage ?? "Executor model request failed.",
+						artifactPaths: [],
+						inputPaths: [],
+					},
+					undefined,
+					false,
+				);
+			}
 			active.lastAgentMessages = undefined;
+			if (
+				active.coordinator &&
+				messages?.some((message) => message.role === "assistant" && message.stopReason === "aborted")
+			)
+				active.coordinator.stop("User cancelled execution.", true);
+			if (active.coordinator && (active.coordinator.state.status !== "executing" || ctx.signal?.aborted)) {
+				await settleCoordinatedRun(pi, ctx, active, setActiveRun);
+				return;
+			}
 			if (!messages) {
 				// Nothing ran since the last settle; there is no turn to call abandoned.
 				return;
@@ -1121,6 +2193,7 @@ export function createSureExtension(): ExtensionFactory {
 				},
 			);
 			const headless = ctx.mode === "print" || ctx.mode === "json";
+			const nudgeLimit = active.coordinator?.limits.finishNudges ?? MAX_FINISH_NUDGES;
 			// Headless gets a continuation prompt below. An interactive operator gets
 			// only this line, and until it named the command there was nothing to act
 			// on: one run sat at "running" for 58 hours with every unit already done.
@@ -1137,16 +2210,30 @@ export function createSureExtension(): ExtensionFactory {
 				return;
 			}
 			active.finishMissing = true;
-			if (headless && (active.finishNudges ?? 0) < MAX_FINISH_NUDGES) {
+			if (headless && (active.finishNudges ?? 0) < nudgeLimit) {
 				active.finishNudges = (active.finishNudges ?? 0) + 1;
+				if (active.coordinator) {
+					active.coordinator.state.finishNudges = (active.coordinator.state.finishNudges ?? 0) + 1;
+					active.coordinator.save();
+				}
 				await pi.sendUserMessage(buildFinishNudge(active.record));
 			}
 		});
 
 		pi.on("session_shutdown", async (_event, ctx) => {
 			const active = activeRun;
-			if (!active) {
+			if (!active || active.shuttingDown) {
 				return;
+			}
+			if (active.coordinator) {
+				active.shuttingDown = true;
+				ctx.setExecutionHold?.(true);
+				active.coordinator.stop("Session shut down before sure_finish.", !active.finishMissing);
+				ctx.abort();
+				await active.diagnosis;
+				await Promise.all([...(active.toolInvocations?.values() ?? [])].map((call) => call.settled));
+				await active.resultQueue;
+				active.coordinator.barrier(coordinatedScope(active));
 			}
 			const runManager = new SureRunManager(active.record.cwd);
 			// A run abandoned by the agent (turn ended, no sure_finish) failed;
@@ -1167,6 +2254,24 @@ export function createSureExtension(): ExtensionFactory {
 				event: { reason: "session_shutdown" },
 			});
 			applyStatePatch(pi, ctx, active, onError.state_patch, "on_error_state");
+			if (active.coordinator) {
+				const report = buildSureFailureReport(
+					active.record,
+					active.coordinator,
+					runManager.readState(active.record),
+				);
+				persistSureFailureReport(active.record, report);
+				pi.appendEntry("sure.failure_report", report);
+				pi.appendEntry(SESSION_OUTCOME_ENTRY, {
+					exitCode: active.record.status === "cancelled" ? 130 : 1,
+					summary: report.stopReason,
+				});
+				active.record = runManager.updateRun(active.record, {}, "terminal_export");
+				active.terminalizing = true;
+				if (!ctx.isIdle()) return;
+				ctx.setContextProjection?.(undefined);
+				ctx.setExecutionHold?.(false);
+			}
 			ctx.ui.setStatus(STATUS_KEY, undefined);
 			clearActiveRun(pi, active, setActiveRun);
 		});

@@ -55,6 +55,7 @@ import type { KeybindingsManager } from "../keybindings.ts";
 import type { CustomMessage } from "../messages.ts";
 import type { ModelRegistry } from "../model-registry.ts";
 import type { ScopedModel } from "../model-resolver.ts";
+import type { IsolatedSessionFactory, SessionContextProjection } from "../session-controls.ts";
 import type {
 	BranchSummaryEntry,
 	CompactionEntry,
@@ -307,6 +308,11 @@ export interface CompactOptions {
 export type ExtensionMode = "tui" | "json" | "print";
 
 export interface ExtensionContext {
+	/** Hold execution at the next complete turn boundary without cancelling in-flight tools. */
+	setExecutionHold?: (held: boolean) => void;
+	/** Register a deterministic view used before context accounting and compaction. */
+	setContextProjection?: (projection: SessionContextProjection | undefined) => void;
+	createIsolatedSession?: IsolatedSessionFactory;
 	/** UI methods for user interaction */
 	ui: ExtensionUIContext;
 	/** Current run mode. Use "tui" to guard terminal-only UI such as custom components. */
@@ -1717,6 +1723,9 @@ export interface ExtensionActions {
  * Required by all modes.
  */
 export interface ExtensionContextActions {
+	setExecutionHold?: (held: boolean) => void;
+	setContextProjection?: (projection: SessionContextProjection | undefined) => void;
+	createIsolatedSession?: IsolatedSessionFactory;
 	getModel: () => Model<any> | undefined;
 	getScopedModels: () => readonly ScopedModel[];
 	isIdle: () => boolean;

@@ -1,3 +1,4 @@
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { Agent, type AgentMessage, setDefaultStreamFn, type ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { clampThinkingLevel, type Message, type Model, streamSimple } from "@earendil-works/pi-ai/compat";
@@ -8,13 +9,16 @@ import { formatNoModelsAvailableMessage } from "./auth-guidance.ts";
 import { withDefaultExtensionFactories } from "./default-extensions.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
 import type { ExtensionRunner, LoadExtensionsResult, SessionStartEvent, ToolDefinition } from "./extensions/index.ts";
+import { createIsolatedResourceLoader } from "./isolated-resource-loader.ts";
 import { convertToLlm } from "./messages.ts";
 import { findInitialModel } from "./model-resolver.ts";
 import { ModelRuntime } from "./model-runtime.ts";
 import type { ResourceLoader } from "./resource-loader.ts";
 import { DefaultResourceLoader } from "./resource-loader.ts";
+import type { IsolatedSessionFactory } from "./session-controls.ts";
 import { getDefaultSessionDir, SessionManager } from "./session-manager.ts";
 import { SettingsManager } from "./settings-manager.ts";
+import { type SureDiagnosticTarget, SureProviderDiagnostics } from "./sure/provider-diagnostics.ts";
 import { time } from "./timings.ts";
 import {
 	createBashTool,
@@ -37,6 +41,9 @@ import {
 setDefaultStreamFn(streamSimple);
 
 export interface CreateAgentSessionOptions {
+	/** Internal SURE supervisor evidence target; absent on ordinary sessions. */
+	sureDiagnostics?: SureDiagnosticTarget;
+	isolatedSessionFactory?: IsolatedSessionFactory;
 	/** Working directory for project-local discovery. Default: process.cwd() */
 	cwd?: string;
 	/** Global config directory. Default: ~/.pi/agent */
@@ -308,6 +315,29 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	const extensionRunnerRef: { current?: ExtensionRunner } = {};
 
+	const sureTarget = (): SureDiagnosticTarget | undefined => {
+		if (options.sureDiagnostics) return options.sureDiagnostics;
+		const entry = sessionManager
+			.getBranch()
+			.reverse()
+			.find((entry) => entry.type === "custom" && entry.customType === "sure.run");
+		if (entry?.type !== "custom") return undefined;
+		const run = entry.data as { runId?: string; runDir?: string; status?: string };
+		if (run.status !== "running" || !run.runId || !run.runDir || !existsSync(join(run.runDir, "coordination.json")))
+			return undefined;
+		try {
+			const current = JSON.parse(readFileSync(join(run.runDir, "run.json"), "utf8")) as {
+				runId: string;
+				status: string;
+			};
+			if (current.runId !== run.runId || current.status !== "running") return undefined;
+		} catch {
+			return undefined;
+		}
+		return { runId: run.runId, runDir: run.runDir, role: "executor" };
+	};
+	let sureDiagnostics: { runId: string; observer: SureProviderDiagnostics } | undefined;
+
 	agent = new Agent({
 		initialState: {
 			systemPrompt: "",
@@ -326,8 +356,43 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const websocketConnectTimeoutMs =
 				options?.websocketConnectTimeoutMs ?? settingsManager.getWebSocketConnectTimeoutMs();
 			const headerRunner = extensionRunnerRef.current;
-			return modelRuntime.streamSimple(model, context, {
+			const target = sureTarget();
+			if (target && sureDiagnostics?.runId !== target.runId)
+				sureDiagnostics = { runId: target.runId, observer: new SureProviderDiagnostics(target) };
+			const diagnostic = target ? sureDiagnostics?.observer.start(model, options?.sessionId) : undefined;
+			const stream = modelRuntime.streamSimple(model, context, {
 				...options,
+				...(diagnostic
+					? {
+							onPayload: async (payload: unknown, requestModel: Model<string>) => {
+								const replacement = await options?.onPayload?.(payload, requestModel);
+								if (model.api !== "openai-completions")
+									diagnostic.payload(replacement === undefined ? payload : replacement);
+								return replacement;
+							},
+							onOpenAICompletionsUsage: diagnostic.usage,
+							...(model.api === "openai-completions"
+								? {
+										fetch: async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+											if (typeof init?.body === "string")
+												diagnostic.payload(
+													JSON.parse(init.body),
+													init.body,
+													input instanceof Request ? input.url : String(input),
+												);
+											diagnostic.headers(
+												Object.fromEntries(
+													new Headers(
+														init?.headers ?? (input instanceof Request ? input.headers : undefined),
+													),
+												),
+											);
+											return (options?.fetch ?? globalThis.fetch)(input, init);
+										},
+									}
+								: {}),
+						}
+					: {}),
 				timeoutMs,
 				websocketConnectTimeoutMs,
 				maxRetries: options?.maxRetries ?? providerRetrySettings.maxRetries,
@@ -339,6 +404,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						: (headers ?? {});
 				},
 			});
+			return diagnostic ? diagnostic.wrap(stream) : stream;
 		},
 		onPayload: async (payload, _model) => {
 			const runner = extensionRunnerRef.current;
@@ -386,6 +452,63 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	}
 
 	const session = new AgentSession({
+		isolatedSessionFactory:
+			options.isolatedSessionFactory ??
+			(async (request) => {
+				const isolatedManager = request.sessionFile
+					? SessionManager.open(request.sessionFile, request.sessionDir)
+					: request.resume
+						? SessionManager.continueRecent(cwd, request.sessionDir)
+						: SessionManager.create(cwd, request.sessionDir, { id: request.sessionId });
+				for (const message of request.recoveryMessages ?? []) isolatedManager.appendMessage(message);
+				const parentTarget = sureTarget();
+				const { session: isolated } = await createAgentSession({
+					sureDiagnostics: parentTarget ? { ...parentTarget, role: "supervisor" } : undefined,
+					cwd,
+					agentDir,
+					modelRuntime,
+					model: session.model,
+					thinkingLevel: session.thinkingLevel,
+					tools: request.tools.map((tool) => tool.name),
+					customTools: request.tools,
+					resourceLoader: createIsolatedResourceLoader(request.systemPrompt),
+					sessionManager: isolatedManager,
+					settingsManager: SettingsManager.inMemory({
+						compaction: settingsManager.getCompactionSettings(),
+						retry: {
+							...settingsManager.getRetrySettings(),
+							provider: settingsManager.getProviderRetrySettings(),
+						},
+						httpIdleTimeoutMs: settingsManager.getHttpIdleTimeoutMs(),
+						websocketConnectTimeoutMs: settingsManager.getWebSocketConnectTimeoutMs(),
+						enableSkillCommands: false,
+						defaultTools: [],
+						transport: settingsManager.getTransport(),
+					}),
+				});
+				let stopAfterTurn = false;
+				isolated.agent.shouldStopAfterTurn = () => stopAfterTurn;
+				isolated.subscribe((event) => {
+					if (event.type === "turn_end") stopAfterTurn = request.onTurn();
+					if (event.type === "compaction_start") request.onCompaction?.();
+				});
+				return {
+					prompt: (text) => isolated.prompt(text, { expandPromptTemplates: false }),
+					disableTools: () => isolated.setActiveToolsByName([]),
+					abort: () => isolated.abort(),
+					dispose: () => isolated.dispose(),
+					getMessages: () => isolated.messages,
+					getSessionIdentity: () => ({
+						id: isolatedManager.getSessionId(),
+						file: isolatedManager.getSessionFile(),
+						leafId: isolatedManager.getLeafId(),
+					}),
+					getUsage: () => {
+						const stats = isolated.getSessionStats();
+						return { ...stats.tokens, cost: stats.cost };
+					},
+				};
+			}),
 		agent,
 		sessionManager,
 		settingsManager,

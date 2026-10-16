@@ -1,6 +1,7 @@
 import type { AssistantMessage, ImageContent } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { SessionShutdownEvent } from "../src/index.ts";
+import { SESSION_OUTCOME_ENTRY } from "../src/core/session-outcome.ts";
+import type { AgentSessionEvent, SessionShutdownEvent } from "../src/index.ts";
 import { runPrintMode } from "../src/modes/print-mode.ts";
 
 type EmitEvent = SessionShutdownEvent;
@@ -139,4 +140,35 @@ describe("runPrintMode", () => {
 		expect(session.extensionRunner.emit).toHaveBeenCalledTimes(1);
 		expect(session.extensionRunner.emit).toHaveBeenCalledWith({ type: "session_shutdown", reason: "quit" });
 	});
+
+	it.each([0, 1, 130])(
+		"uses persisted extension outcome %s even when no assistant error was emitted",
+		async (code) => {
+			const runtimeHost = createRuntimeHost(createAssistantMessage({ text: "" }));
+			let publish: ((event: AgentSessionEvent) => void) | undefined;
+			runtimeHost.session.subscribe.mockImplementation((listener: (event: AgentSessionEvent) => void) => {
+				publish = listener;
+				return () => {};
+			});
+			runtimeHost.session.prompt.mockImplementation(async () => {
+				publish?.({
+					type: "entry_appended",
+					entry: {
+						type: "custom",
+						id: "outcome",
+						parentId: null,
+						timestamp: new Date().toISOString(),
+						customType: SESSION_OUTCOME_ENTRY,
+						data: { exitCode: code, summary: "Deterministic terminal outcome" },
+					},
+				});
+			});
+			expect(
+				await runPrintMode(runtimeHost as unknown as Parameters<typeof runPrintMode>[0], {
+					mode: "json",
+					initialMessage: "Task",
+				}),
+			).toBe(code);
+		},
+	);
 });

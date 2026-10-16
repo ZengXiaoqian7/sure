@@ -4,12 +4,43 @@
 	"description": "Onboard or repair a model, validate its inference contract, and seal either a digest-pinned container or a site-approved local Python Eval binding.",
 	"prompt": "SKILL.md",
 	"hooks": {
-		"pre_start": [{ "module": "hooks/index.ts", "handler": "preStart" }],
-		"pre_tool_call": [{ "module": "hooks/index.ts", "handler": "preToolCall" }],
-		"post_tool_result": [{ "module": "hooks/index.ts", "handler": "postToolResult" }],
-		"pre_finish": [{ "module": "hooks/index.ts", "handler": "preFinish" }],
-		"post_finish": [{ "module": "hooks/index.ts", "handler": "postFinish" }],
-		"on_error": [{ "module": "hooks/index.ts", "handler": "onError" }]
+		"prepare_stop": [{ "module": "hooks/stop.ts", "handler": "prepareStop" }],
+		"pre_start": [
+			{
+				"module": "hooks/index.ts",
+				"handler": "preStart"
+			}
+		],
+		"pre_tool_call": [
+			{
+				"module": "hooks/index.ts",
+				"handler": "preToolCall"
+			}
+		],
+		"post_tool_result": [
+			{
+				"module": "hooks/index.ts",
+				"handler": "postToolResult"
+			}
+		],
+		"pre_finish": [
+			{
+				"module": "hooks/index.ts",
+				"handler": "preFinish"
+			}
+		],
+		"post_finish": [
+			{
+				"module": "hooks/index.ts",
+				"handler": "postFinish"
+			}
+		],
+		"on_error": [
+			{
+				"module": "hooks/index.ts",
+				"handler": "onError"
+			}
+		]
 	},
 	"artifacts": [
 		{
@@ -60,8 +91,411 @@
 		}
 	],
 	"ui": {
-		"primaryCounters": ["completed_units", "total_units", "gate_blocks"],
-		"artifactTypes": ["verdict", "deployment_ready", "runtime_inventory", "model_spec", "wrapper", "build_plan", "fixture_manifest", "package_gate", "artifact_manifest"],
-		"defaultExpandedSections": ["diagnostics", "artifacts"]
+		"primaryCounters": [
+			"completed_units",
+			"total_units",
+			"gate_blocks"
+		],
+		"artifactTypes": [
+			"verdict",
+			"deployment_ready",
+			"runtime_inventory",
+			"model_spec",
+			"wrapper",
+			"build_plan",
+			"fixture_manifest",
+			"package_gate",
+			"artifact_manifest"
+		],
+		"defaultExpandedSections": [
+			"diagnostics",
+			"artifacts"
+		]
+	},
+	"coordination": {
+		"version": 1,
+		"budgets": {
+			"supervisorRepairsPerUnit": 2,
+			"diagnosesPerUnit": 3,
+			"noProgressChecks": 3,
+			"checksPerUnit": 40,
+			"finishNudges": 3
+		},
+		"commonPrompt": "prompts/common.md",
+		"stages": [
+			{
+				"id": "load_model_input",
+				"prompt": "prompts/load_model_input.md",
+				"references": [
+					"schemas/model_input_resolved.schema.json",
+					"scripts/check_model_input.py",
+					"scripts/materialize_onboard_inputs.py"
+				],
+				"snapshotPaths": [
+					"run:artifacts",
+					"package:hooks",
+					"package:sure.skill.json",
+					"package:schemas/model_input_resolved.schema.json",
+					"package:scripts/check_model_input.py",
+					"package:scripts/materialize_onboard_inputs.py"
+				]
+			},
+			{
+				"id": "context_selection",
+				"prompt": "prompts/context_selection.md",
+				"references": [
+					"schemas/context_selection.schema.json",
+					"references/memory/ROUTING.md"
+				],
+				"snapshotPaths": [
+					"run:artifacts",
+					"package:hooks",
+					"package:sure.skill.json",
+					"package:schemas/context_selection.schema.json"
+				]
+			},
+			{
+				"id": "discover",
+				"prompt": "prompts/discover.md",
+				"references": [
+					"schemas/repo_summary.schema.json"
+				],
+				"snapshotPaths": [
+					"run:artifacts",
+					"package:hooks",
+					"package:sure.skill.json",
+					"package:schemas/repo_summary.schema.json"
+				]
+			},
+			{
+				"id": "classify",
+				"prompt": "prompts/classify.md",
+				"references": [
+					"schemas/classification.schema.json"
+				],
+				"snapshotPaths": [
+					"run:artifacts",
+					"package:hooks",
+					"package:sure.skill.json",
+					"package:schemas/classification.schema.json"
+				]
+			},
+			{
+				"id": "plan",
+				"prompt": "prompts/plan.md",
+				"references": [
+					"schemas/backend_choice.schema.json",
+					"references/policies/backend_selection.md",
+					"references/playbooks/env_ROUTING.md"
+				],
+				"snapshotPaths": [
+					"run:artifacts",
+					"package:hooks",
+					"package:sure.skill.json",
+					"package:schemas/backend_choice.schema.json"
+				]
+			},
+			{
+				"id": "build_plan",
+				"prompt": "prompts/build_plan.md",
+				"references": [
+					"schemas/build_plan.schema.json",
+					"scripts/check_build_plan.py",
+					"scripts/materialize_model_runtime.py"
+				],
+				"snapshotPaths": [
+					"run:artifacts",
+					"package:hooks",
+					"package:sure.skill.json",
+					"package:schemas/build_plan.schema.json",
+					"package:scripts/check_build_plan.py"
+				]
+			},
+			{
+				"id": "validate_spec",
+				"prompt": "prompts/validate_spec.md",
+				"references": [
+					"schemas/spec_validation.schema.json",
+					"references/contracts/spec_validation.md",
+					"scripts/check_spec.py"
+				],
+				"snapshotPaths": [
+					"run:artifacts",
+					"package:hooks",
+					"package:sure.skill.json",
+					"package:schemas/spec_validation.schema.json",
+					"package:scripts/check_spec.py"
+				]
+			},
+			{
+				"id": "prepare_fixture",
+				"prompt": "prompts/prepare_fixture.md",
+				"references": [
+					"schemas/fixture_manifest.schema.json",
+					"scripts/check_fixture.py",
+					"scripts/prepare_fixture.py"
+				],
+				"snapshotPaths": [
+					"run:artifacts",
+					"package:hooks",
+					"package:sure.skill.json",
+					"package:schemas/fixture_manifest.schema.json",
+					"package:scripts/check_fixture.py"
+				]
+			},
+			{
+				"id": "build_env",
+				"prompt": "prompts/build_env.md",
+				"references": [
+					"schemas/build_env_result.schema.json",
+					"scripts/check_env.py",
+					"scripts/materialize_model_runtime.py"
+				],
+				"snapshotPaths": [
+					"run:artifacts",
+					"package:hooks",
+					"package:sure.skill.json",
+					"package:schemas/build_env_result.schema.json",
+					"package:scripts/check_env.py",
+					"package:scripts/materialize_model_runtime.py"
+				],
+				"diagnosticPaths": [
+					"project:sure/site/loader.py",
+					"project:sure/site/loader.ts",
+					"project:config/site.bundled.yaml",
+					"project:config/site.local.yaml",
+					"project:config/site.default.yaml"
+				]
+			},
+			{
+				"id": "fetch_weights",
+				"prompt": "prompts/fetch_weights.md",
+				"references": [
+					"schemas/weights_manifest.schema.json",
+					"references/contracts/model_local_checkpoint_rule.md",
+					"scripts/check_weights.py"
+				],
+				"snapshotPaths": [
+					"run:artifacts",
+					"package:hooks",
+					"package:sure.skill.json",
+					"package:schemas/weights_manifest.schema.json",
+					"package:scripts/check_weights.py"
+				]
+			},
+			{
+				"id": "validate_env_compat",
+				"prompt": "prompts/validate_env_compat.md",
+				"references": [
+					"schemas/env_compat_result.schema.json",
+					"scripts/check_env_compat.py"
+				],
+				"snapshotPaths": [
+					"run:artifacts",
+					"package:hooks",
+					"package:sure.skill.json",
+					"package:schemas/env_compat_result.schema.json",
+					"package:scripts/check_env_compat.py"
+				]
+			},
+			{
+				"id": "generate_wrapper",
+				"prompt": "prompts/generate_wrapper.md",
+				"references": [
+					"schemas/wrapper_manifest.schema.json",
+					"scripts/templates/validate.py"
+				],
+				"snapshotPaths": [
+					"run:artifacts",
+					"package:hooks",
+					"package:sure.skill.json",
+					"package:schemas/wrapper_manifest.schema.json"
+				],
+				"diagnosticPaths": [
+					"project:sure/skills/sure_infer/scripts/server_protocol.py",
+					"project:sure/skills/sure_infer/scripts/generate_predictions_via_server.py"
+				]
+			},
+			{
+				"id": "validate_import",
+				"prompt": "prompts/validate_import.md",
+				"references": [
+					"schemas/import_result.schema.json",
+					"scripts/run_validate.py"
+				],
+				"snapshotPaths": [
+					"run:artifacts",
+					"package:hooks",
+					"package:sure.skill.json",
+					"package:schemas/import_result.schema.json",
+					"package:scripts/run_validate.py"
+				]
+			},
+			{
+				"id": "validate_load",
+				"prompt": "prompts/validate_load.md",
+				"references": [
+					"schemas/load_result.schema.json",
+					"scripts/run_validate.py"
+				],
+				"snapshotPaths": [
+					"run:artifacts",
+					"package:hooks",
+					"package:sure.skill.json",
+					"package:schemas/load_result.schema.json",
+					"package:scripts/run_validate.py"
+				]
+			},
+			{
+				"id": "validate_infer",
+				"prompt": "prompts/validate_infer.md",
+				"references": [
+					"schemas/infer_result.schema.json",
+					"scripts/run_validate.py"
+				],
+				"snapshotPaths": [
+					"run:artifacts",
+					"package:hooks",
+					"package:sure.skill.json",
+					"package:schemas/infer_result.schema.json",
+					"package:scripts/run_validate.py"
+				]
+			},
+			{
+				"id": "validate_contract",
+				"prompt": "prompts/validate_contract.md",
+				"references": [
+					"schemas/contract_result.schema.json",
+					"scripts/run_validate.py"
+				],
+				"snapshotPaths": [
+					"run:artifacts",
+					"package:hooks",
+					"package:sure.skill.json",
+					"package:schemas/contract_result.schema.json",
+					"package:scripts/run_validate.py"
+				],
+				"diagnosticPaths": [
+					"project:sure/skills/sure_infer/scripts/server_protocol.py",
+					"project:sure/skills/sure_infer/scripts/generate_predictions_via_server.py"
+				]
+			},
+			{
+				"id": "package_container",
+				"prompt": "prompts/package_container.md",
+				"references": [
+					"schemas/docker_registry_result.schema.json",
+					"scripts/check_container_package.py",
+					"scripts/describe_harness_runtime.py"
+				],
+				"snapshotPaths": [
+					"run:artifacts",
+					"package:hooks",
+					"package:sure.skill.json",
+					"package:schemas/docker_registry_result.schema.json",
+					"package:scripts/check_container_package.py"
+				]
+			},
+			{
+				"id": "save_artifacts",
+				"prompt": "prompts/save_artifacts.md",
+				"references": [
+					"schemas/artifact_manifest.schema.json",
+					"scripts/check_artifact_manifest.py",
+					"scripts/stage_model_artifacts.py"
+				],
+				"snapshotPaths": [
+					"run:artifacts",
+					"package:hooks",
+					"package:sure.skill.json",
+					"package:schemas/artifact_manifest.schema.json",
+					"package:scripts/check_artifact_manifest.py"
+				]
+			},
+			{
+				"id": "package_gate",
+				"prompt": "prompts/package_gate.md",
+				"references": [
+					"schemas/package_gate.schema.json",
+					"scripts/check_package_gate.py",
+					"scripts/write_package_gate.py"
+				],
+				"snapshotPaths": [
+					"run:artifacts",
+					"package:hooks",
+					"package:sure.skill.json",
+					"package:schemas/package_gate.schema.json",
+					"package:scripts/check_package_gate.py"
+				]
+			},
+			{
+				"id": "write_runtime_inventory",
+				"prompt": "prompts/write_runtime_inventory.md",
+				"references": [
+					"schemas/runtime_inventory.schema.json",
+					"scripts/check_runtime_inventory.py",
+					"scripts/write_runtime_inventory.py"
+				],
+				"snapshotPaths": [
+					"run:artifacts",
+					"package:hooks",
+					"package:sure.skill.json",
+					"package:schemas/runtime_inventory.schema.json",
+					"package:scripts/check_runtime_inventory.py"
+				]
+			},
+			{
+				"id": "verdict",
+				"prompt": "prompts/verdict.md",
+				"references": [
+					"schemas/verdict.schema.json",
+					"scripts/check_verdict.py",
+					"scripts/write_verdict.py"
+				],
+				"snapshotPaths": [
+					"run:artifacts",
+					"package:hooks",
+					"package:sure.skill.json",
+					"package:schemas/verdict.schema.json",
+					"package:scripts/check_verdict.py"
+				]
+			},
+			{
+				"id": "extract_lessons",
+				"prompt": "prompts/extract_lessons.md",
+				"references": [
+					"schemas/extraction_declaration.schema.json",
+					"scripts/check_memory_extraction.py"
+				],
+				"snapshotPaths": [
+					"run:artifacts",
+					"package:hooks",
+					"package:sure.skill.json",
+					"package:schemas/extraction_declaration.schema.json",
+					"package:scripts/check_memory_extraction.py"
+				],
+				"diagnosticPaths": ["project:sure/runtime/memory/EXTRACTION.md"]
+			},
+			{
+				"id": "finalize_model_bundle",
+				"prompt": "prompts/finalize_model_bundle.md",
+				"references": [
+					"schemas/deployment_ready_output.schema.json",
+					"scripts/check_finalized_bundle.py",
+					"scripts/finalize_model_bundle.py"
+				],
+				"snapshotPaths": [
+					"run:artifacts",
+					"package:hooks",
+					"package:sure.skill.json",
+					"package:schemas/deployment_ready_output.schema.json",
+					"package:scripts/check_finalized_bundle.py"
+				],
+				"diagnosticPaths": [
+					"project:sure/skills/sure_infer/scripts/server_protocol.py",
+					"project:sure/skills/sure_infer/scripts/generate_predictions_via_server.py"
+				]
+			}
+		]
 	}
 }

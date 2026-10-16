@@ -1,5 +1,6 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { parseSureCoordinationPolicy } from "./coordination-contracts.ts";
 import type { SureHookDeclaration, SureHookPoint, SureSkillManifest, SureSkillPackage } from "./types.ts";
 
 const SURE_SKILLS_DIR = ".sure/skills";
@@ -23,6 +24,7 @@ const HOOK_POINTS = new Set<SureHookPoint>([
 	"pre_tool_call",
 	"post_tool_result",
 	"pre_finish",
+	"prepare_stop",
 	"post_finish",
 	"on_error",
 ]);
@@ -150,6 +152,7 @@ function parseManifest(raw: unknown): SureSkillManifest | undefined {
 		hooks: parseHooks(raw.hooks),
 		artifacts: parseArtifacts(raw.artifacts),
 		ui: parseUiHints(raw.ui),
+		coordination: parseSureCoordinationPolicy(raw.coordination),
 	};
 }
 
@@ -207,6 +210,23 @@ function loadPackage(
 					type: "error",
 					message: "Sure hook module path must exist inside the skill package",
 					path: hookPath ?? join(packageDir, declaration.module),
+				});
+				return undefined;
+			}
+		}
+	}
+	if (parsed.coordination) {
+		const materials = [
+			parsed.coordination.commonPrompt,
+			...parsed.coordination.stages.flatMap((stage) => [stage.prompt, ...stage.references]),
+		];
+		for (const material of materials) {
+			const path = resolvePackagePath(packageDir, material);
+			if (!path || !existsSync(path) || !statSync(path).isFile()) {
+				diagnostics.push({
+					type: "error",
+					message: "Sure coordination material must be a file inside the skill package",
+					path: material,
 				});
 				return undefined;
 			}

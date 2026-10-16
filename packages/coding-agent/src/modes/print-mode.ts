@@ -10,6 +10,7 @@ import type { AssistantMessage, ImageContent } from "@earendil-works/pi-ai";
 import type { AgentSessionRuntime } from "../core/agent-session-runtime.ts";
 import { noOpUIContext } from "../core/extensions/index.ts";
 import { flushRawStdout, waitForRawStdoutBackpressure, writeRawStdout } from "../core/output-guard.ts";
+import { SESSION_OUTCOME_ENTRY } from "../core/session-outcome.ts";
 import { killTrackedDetachedChildren } from "../utils/shell.ts";
 import { toJsonEvent } from "./json-event.ts";
 
@@ -34,6 +35,7 @@ export interface PrintModeOptions {
 export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: PrintModeOptions): Promise<number> {
 	const { mode, messages = [], initialMessage, initialImages } = options;
 	let exitCode = 0;
+	let terminalExitCode: number | undefined;
 	let session = runtimeHost.session;
 	let unsubscribe: (() => void) | undefined;
 	let unsubscribeBackpressure: (() => void) | undefined;
@@ -120,6 +122,20 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 		unsubscribe?.();
 		unsubscribeBackpressure?.();
 		unsubscribe = session.subscribe((event) => {
+			if (
+				event.type === "entry_appended" &&
+				event.entry.type === "custom" &&
+				event.entry.customType === SESSION_OUTCOME_ENTRY
+			) {
+				const data = event.entry.data;
+				if (
+					data &&
+					typeof data === "object" &&
+					"exitCode" in data &&
+					(data.exitCode === 0 || data.exitCode === 1 || data.exitCode === 130)
+				)
+					terminalExitCode = data.exitCode;
+			}
 			if (mode === "json") {
 				writeRawStdout(`${JSON.stringify(toJsonEvent(event))}\n`);
 			}
@@ -147,6 +163,7 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 		}
 
 		for (const message of messages) {
+			terminalExitCode = undefined;
 			await session.prompt(message);
 		}
 
@@ -169,7 +186,7 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 			}
 		}
 
-		return exitCode;
+		return terminalExitCode ?? exitCode;
 	} catch (error: unknown) {
 		console.error(error instanceof Error ? error.message : String(error));
 		return 1;

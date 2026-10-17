@@ -546,9 +546,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				return block;
 			};
 
-			let chunkIndex = 0;
 			for await (const chunk of openaiStream) {
-				chunkIndex++;
 				if (!chunk || typeof chunk !== "object") continue;
 
 				// OpenAI documents ChatCompletionChunk.id as the unique chat completion identifier,
@@ -559,13 +557,6 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				}
 				if (chunk.usage) {
 					output.usage = parseChunkUsage(chunk.usage, model);
-					options?.onOpenAICompletionsUsage?.({
-						source: "chunk.usage",
-						chunkIndex,
-						usage: chunk.usage,
-						applied: true,
-						normalized: output.usage,
-					});
 				}
 
 				const choice = Array.isArray(chunk.choices) ? chunk.choices[0] : undefined;
@@ -573,18 +564,8 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 
 				// Fallback: some providers (e.g., Moonshot) return usage
 				// in choice.usage instead of the standard chunk.usage
-				const choiceUsage = (
-					choice as ChatCompletionChunk.Choice & { usage?: Parameters<typeof parseChunkUsage>[0] }
-				).usage;
-				if (choiceUsage) {
-					if (!chunk.usage) output.usage = parseChunkUsage(choiceUsage, model);
-					options?.onOpenAICompletionsUsage?.({
-						source: "choice.usage",
-						chunkIndex,
-						usage: choiceUsage,
-						applied: !chunk.usage,
-						normalized: output.usage,
-					});
+				if (!chunk.usage && (choice as any).usage) {
+					output.usage = parseChunkUsage((choice as any).usage, model);
 				}
 
 				if (choice.finish_reason) {
@@ -752,7 +733,6 @@ export const streamSimple: StreamFunction<"openai-completions", SimpleStreamOpti
 	const base = {
 		...buildBaseOptions(model, context, options, options?.apiKey),
 		toolChoice: options?.toolChoice,
-		onOpenAICompletionsUsage: options?.onOpenAICompletionsUsage,
 	} satisfies OpenAICompletionsOptions;
 	const clampedReasoning = options?.reasoning ? clampThinkingLevel(model, options.reasoning) : undefined;
 	const reasoningEffort = clampedReasoning === "off" ? undefined : clampedReasoning;

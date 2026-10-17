@@ -74,7 +74,9 @@ export function sureCurrentRepairAttempt(
 	index: ReturnType<typeof loadSureDiagnosticIndex>,
 ) {
 	const repair = coordinator.state.repairs?.filter((repair) => repair.unitId === coordinator.state.unitId).at(-1);
-	const triggerBatchId = repair?.triggerBatchId ?? coordinator.state.lastFailure?.action?.batchId;
+	const failure = index.checks.find(({ version }) => version === coordinator.state.unresolvedCheckVersion);
+	const triggerBatchId =
+		repair?.triggerBatchId ?? failure?.check.action?.batchId ?? coordinator.state.lastFailure?.action?.batchId;
 	if (!repair && !triggerBatchId) return undefined;
 	const unitId = repair?.unitId ?? coordinator.state.unitId;
 	const versions = new Set(repair?.checkVersions ?? []);
@@ -82,6 +84,16 @@ export function sureCurrentRepairAttempt(
 		(action) =>
 			(action.checkVersion !== undefined && versions.has(action.checkVersion)) ||
 			(triggerBatchId !== undefined && action.batchId === triggerBatchId) ||
+			(!repair &&
+				failure !== undefined &&
+				action.checkUnitId === unitId &&
+				action.checkVersion !== undefined &&
+				action.checkVersion >= failure.version) ||
+			(!repair &&
+				failure !== undefined &&
+				action.unitId === unitId &&
+				action.requestedAt !== undefined &&
+				action.requestedAt >= failure.timestamp) ||
 			(repair !== undefined &&
 				action.unitId === unitId &&
 				action.requestedAt !== undefined &&
@@ -204,15 +216,6 @@ export function loadSureDiagnosticIndex(coordinator: SureCoordinator) {
 		actions,
 		hooks,
 		stages: [...stages.values()],
-		historicalScope: [
-			...actions.map((action) => action.path),
-			...evidenceChecks.flatMap((check) => [
-				...check.inputPaths,
-				...check.artifactPaths,
-				...(check.diagnosticPaths ?? []),
-				...(check.action ? [check.action.path] : []),
-			]),
-		],
 		readOnlyScope: [
 			...actions.map((action) => action.path),
 			...evidenceChecks.flatMap((check) => [
@@ -248,42 +251,6 @@ export function packSureDiffIndex(entries: ReturnType<typeof sureDiffIndex>) {
 		groups.set(key, group);
 	}
 	return { encoding: "status-directory-basenames-v1", count: entries.length, groups: [...groups.values()] };
-}
-
-/** A tool batch is indivisible; absent batch IDs become distinct single-action batches. */
-export function sureDiagnosticBatches(index: ReturnType<typeof loadSureDiagnosticIndex>) {
-	const batches = new Map<string, typeof index.actions>();
-	for (const action of index.actions) {
-		const id = action.batchId ?? `action:${action.toolCallId}`;
-		const batch = batches.get(id) ?? [];
-		batch.push(action);
-		batches.set(id, batch);
-	}
-	return [...batches].map(([id, actions]) => ({ id, actions }));
-}
-
-export function sureDiagnosticRange(
-	index: ReturnType<typeof loadSureDiagnosticIndex>,
-	startBatch?: string,
-	endBatch?: string,
-) {
-	const batches = sureDiagnosticBatches(index);
-	const start = startBatch === undefined ? 0 : batches.findIndex((batch) => batch.id === startBatch);
-	const end = endBatch === undefined ? batches.length - 1 : batches.findIndex((batch) => batch.id === endBatch);
-	if (start < 0 || (end < start && (batches.length > 0 || startBatch !== undefined || endBatch !== undefined)))
-		throw new Error("Unknown or reversed batch range.");
-	const selected = batches.slice(start, end + 1);
-	const middle = Math.ceil(selected.length / 2);
-	const boundary = (items: typeof selected) =>
-		items.length ? { startBatch: items[0].id, endBatch: items.at(-1)!.id } : null;
-	return {
-		range: boundary(selected),
-		left: boundary(selected.slice(0, middle)),
-		right: boundary(selected.slice(middle)),
-		batches: selected.map(({ id, actions }) => ({ id, actions: sureActionIndex(actions) })),
-		instruction:
-			"Both halves remain candidates. Follow cross-range references; a preview or a model preference does not exclude a half. Verify selected actions and checks, including later corrections, before issuing a repair or stop.",
-	};
 }
 
 /** Pages remain valid JSON even when the serialized evidence spans several reads. */

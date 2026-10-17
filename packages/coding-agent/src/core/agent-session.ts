@@ -309,6 +309,12 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
 
 export class AgentSession {
 	private _contextProjection: SessionContextProjection | undefined;
+	private _toolPreparations = new Map<
+		string,
+		{ prepared?: boolean; validated?: boolean; rejection?: ToolExecutionEndEvent["rejection"] }
+	>();
+	private _preparingToolCallId: string | undefined;
+	private _turnToolNames = new Set<string>();
 	private _executionHeld = false;
 	private _holdAbortController: AbortController | undefined;
 	private _isolatedSessionFactory: IsolatedSessionFactory | undefined;
@@ -500,19 +506,24 @@ export class AgentSession {
 	 */
 	private _installAgentToolHooks(): void {
 		this.agent.beforeToolCall = async ({ toolCall, args }) => {
+			const preparation = this._toolPreparations.get(toolCall.id);
+			if (preparation) preparation.validated = true;
 			const runner = this._extensionRunner;
 			if (!runner.hasHandlers("tool_call")) {
 				return undefined;
 			}
 
 			try {
-				return await runner.emitToolCall({
+				const result = await runner.emitToolCall({
 					type: "tool_call",
 					toolName: toolCall.name,
 					toolCallId: toolCall.id,
 					input: args as Record<string, unknown>,
 				});
+				if (preparation && result?.block) preparation.rejection = "preflight";
+				return result;
 			} catch (err) {
+				if (preparation) preparation.rejection = "preflight";
 				if (err instanceof Error) {
 					throw err;
 				}
@@ -619,6 +630,7 @@ export class AgentSession {
 			const context = await this._compactBeforeNextAssistantResponse(turn.context);
 			const previousSnapshot = await previousPrepareNextTurnWithContext?.({ ...turn, context }, signal);
 			const nextContext = previousSnapshot?.context ?? context;
+			this._turnToolNames = new Set(this.agent.state.tools.map((tool) => tool.name));
 
 			return {
 				...previousSnapshot,
@@ -692,6 +704,7 @@ export class AgentSession {
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	private _handleAgentEvent = async (event: AgentEvent): Promise<void> => {
+		if (event.type === "agent_start") this._turnToolNames = new Set(this.agent.state.tools.map((tool) => tool.name));
 		// When a user message starts, check if it's from either queue and remove it BEFORE emitting
 		// This ensures the UI sees the updated queue state
 		if (event.type === "message_start" && event.message.role === "user") {
@@ -872,6 +885,10 @@ export class AgentSession {
 				this._replaceMessageInPlace(event.message, normalized);
 			}
 		} else if (event.type === "tool_execution_start") {
+			if (this._contextProjection) {
+				this._preparingToolCallId = event.toolCallId;
+				this._toolPreparations.set(event.toolCallId, {});
+			}
 			const extensionEvent: ToolExecutionStartEvent = {
 				type: "tool_execution_start",
 				toolCallId: event.toolCallId,
@@ -889,12 +906,25 @@ export class AgentSession {
 			};
 			await this._extensionRunner.emit(extensionEvent);
 		} else if (event.type === "tool_execution_end") {
+			const preparation = this._toolPreparations.get(event.toolCallId);
+			this._toolPreparations.delete(event.toolCallId);
+			let rejection = preparation?.rejection;
+			if (preparation?.prepared && !preparation.validated && !rejection) rejection = "arguments";
+			if (preparation && !this._turnToolNames.has(event.toolName)) rejection = "tool_not_found";
+			if (
+				this._executionHeld ||
+				this.agent.signal?.aborted ||
+				this._holdAbortController?.signal.aborted ||
+				this._lastAssistantMessage?.stopReason === "length"
+			)
+				rejection = undefined;
 			const extensionEvent: ToolExecutionEndEvent = {
 				type: "tool_execution_end",
 				toolCallId: event.toolCallId,
 				toolName: event.toolName,
 				result: event.result,
 				isError: event.isError,
+				...(rejection ? { rejection } : {}),
 			};
 			await this._extensionRunner.emit(extensionEvent);
 		}
@@ -2824,6 +2854,26 @@ export class AgentSession {
 		const toolRegistry = new Map(wrappedBuiltInTools.map((tool) => [tool.name, tool]));
 		for (const tool of wrappedExtensionTools as AgentTool[]) {
 			toolRegistry.set(tool.name, tool);
+		}
+		for (const [name, tool] of toolRegistry) {
+			const prepare = tool.prepareArguments;
+			toolRegistry.set(name, {
+				...tool,
+				prepareArguments: (args) => {
+					const observation = this._preparingToolCallId
+						? this._toolPreparations.get(this._preparingToolCallId)
+						: undefined;
+					try {
+						// Observe the real preparation once; it may mutate arguments.
+						const prepared = prepare ? prepare.call(tool, args) : args;
+						if (observation) observation.prepared = true;
+						return prepared;
+					} catch (error) {
+						if (observation) observation.rejection = "preparation";
+						throw error;
+					}
+				},
+			});
 		}
 		this._toolRegistry = toolRegistry;
 

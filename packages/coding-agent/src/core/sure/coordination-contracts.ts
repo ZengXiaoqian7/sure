@@ -5,7 +5,6 @@ import {
 	type SureCheckEvidence,
 	type SureCoordinationLimits,
 	type SureCoordinationPolicy,
-	type SureDiagnosisCheckpoint,
 	type SureDiagnosisResult,
 } from "./coordination-types.ts";
 
@@ -21,83 +20,23 @@ const diagnosisProperties = {
 	unknowns: diagnosisTexts,
 	nextActions: diagnosisTexts,
 	evidenceReferences: Type.Array(diagnosisText, { minItems: 1, maxItems: 256 }),
-	repair: Type.Optional(diagnosisText),
-	stopReason: Type.Optional(diagnosisText),
-	targetFiles: Type.Optional(diagnosisTexts),
 	focusPaths: Type.Optional(diagnosisTexts),
 	validation: Type.Optional(diagnosisText),
 	stopBoundary: Type.Optional(diagnosisText),
 };
 
-/** The model sees the same flat structures that the harness checks, without coercion. */
 export const SURE_DIAGNOSIS_SCHEMA = Type.Union([
 	Type.Object({
 		...diagnosisProperties,
 		decision: Type.Literal("repair"),
 		repair: diagnosisText,
-		targetFiles: diagnosisTexts,
-		validation: diagnosisText,
-		stopBoundary: diagnosisText,
+		targetFiles: Type.Optional(diagnosisTexts),
 	}),
-	Type.Object({
-		...diagnosisProperties,
-		decision: Type.Literal("stop"),
-		stopReason: diagnosisText,
-		stopAssessment: Type.Object({
-			basis: Type.Union([
-				Type.Literal("external_blocker"),
-				Type.Literal("constraint_conflict"),
-				Type.Literal("no_viable_route"),
-			]),
-			blockingCondition: diagnosisText,
-			evidenceReferences: Type.Array(
-				Type.Object({
-					reference: diagnosisText,
-					kind: Type.Union([
-						Type.Literal("source"),
-						Type.Literal("gate_failure"),
-						Type.Literal("tool_result"),
-						Type.Literal("user_constraint"),
-					]),
-				}),
-				{ minItems: 1, maxItems: 256 },
-			),
-			continuationAssessment: diagnosisText,
-			blockingUnknowns: diagnosisTexts,
-		}),
-	}),
+	Type.Object({ ...diagnosisProperties, decision: Type.Literal("continue"), reason: diagnosisText }),
 ]);
 const diagnosisValidator = Compile(SURE_DIAGNOSIS_SCHEMA);
 const repairValidator = Compile(SURE_DIAGNOSIS_SCHEMA.anyOf[0]);
-const stopValidator = Compile(SURE_DIAGNOSIS_SCHEMA.anyOf[1]);
-
-// Retained for historical records and internal checkpoints, not the model's control interface.
-export const SURE_INVESTIGATION_SCHEMA = Type.Union([
-	SURE_DIAGNOSIS_SCHEMA,
-	Type.Object({
-		runId: diagnosisText,
-		unitId: diagnosisText,
-		evidenceVersion: Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
-		decision: Type.Literal("checkpoint"),
-		checkpoint: Type.String({ minLength: 1, maxLength: 4000, pattern: "\\S" }),
-		facts: diagnosisTexts,
-		hypotheses: diagnosisTexts,
-		unknowns: diagnosisTexts,
-		nextActions: diagnosisTexts,
-		evidenceReferences: Type.Array(diagnosisText, { minItems: 1, maxItems: 256 }),
-		nextReads: Type.Array(Type.Record(Type.String(), Type.Unknown()), { minItems: 1, maxItems: 4 }),
-		candidateRange: Type.Union([Type.Object({ startBatch: diagnosisText, endBatch: diagnosisText }), Type.Null()]),
-		supportingEvidence: diagnosisTexts,
-		opposingEvidence: diagnosisTexts,
-	}),
-]);
-const checkpointValidator = Compile(SURE_INVESTIGATION_SCHEMA.anyOf[1]);
-
-export function parseSureDiagnosisCheckpoint(value: unknown): SureDiagnosisCheckpoint {
-	if (JSON.stringify(value).length > 32_000 || !checkpointValidator.Check(value))
-		throw new Error("Invalid bounded investigation checkpoint.");
-	return { ...value, automatic: false };
-}
+const continueValidator = Compile(SURE_DIAGNOSIS_SCHEMA.anyOf[1]);
 
 function record(value: unknown): Record<string, unknown> {
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Expected an object.");
@@ -178,15 +117,26 @@ export function parseSureCheckEvidence(value: unknown): SureCheckEvidence | unde
 		throw new Error("Invalid Sure check failure kind.");
 	}
 	const progress = raw.progress === undefined ? undefined : record(raw.progress);
-	if (raw.recovery !== undefined && raw.recovery !== "local_once" && raw.recovery !== "diagnose")
-		throw new Error("Invalid Sure recovery disposition.");
+	const condition = raw.condition === undefined ? undefined : record(raw.condition);
+	if (raw.localProgress !== undefined && typeof raw.localProgress !== "boolean")
+		throw new Error("Invalid skill-verified local progress.");
+	if (condition?.localRepair !== undefined && typeof condition.localRepair !== "boolean")
+		throw new Error("Invalid local repair disposition.");
+	if (raw.recovery !== undefined) throw new Error("Legacy recovery quotas are not supported.");
 	if (progress && (!Number.isSafeInteger(progress.completed) || Number(progress.completed) < 0))
 		throw new Error("Invalid verified progress milestone.");
 	return {
 		unitId: string(raw.unitId),
 		outcome,
 		failureKind,
-		recovery: raw.recovery,
+		condition: condition
+			? {
+					id: string(condition.id),
+					target: condition.target === undefined ? undefined : string(condition.target),
+					localRepair: condition.localRepair,
+				}
+			: undefined,
+		localProgress: raw.localProgress,
 		summary: string(raw.summary),
 		repair: raw.repair === undefined ? undefined : string(raw.repair),
 		artifactPaths: strings(raw.artifactPaths),
@@ -200,14 +150,13 @@ export function parseSureCheckEvidence(value: unknown): SureCheckEvidence | unde
 	};
 }
 
-export function allowsSureDirectRepair(check: SureCheckEvidence): boolean {
-	return check.outcome === "blocked";
-}
-
 export function parseSureDiagnosisResult(value: unknown): SureDiagnosisResult {
+	if (value && typeof value === "object" && "kind" in value && value.kind === "evidence")
+		throw new Error("Evidence return tasks are retired; supervisor guidance must cover the complete correction.");
 	const decision = value && typeof value === "object" && "decision" in value ? value.decision : undefined;
-	// Inspect the selected branch so a missing repair field is not obscured by stop-branch errors.
-	const validator = decision === "repair" ? repairValidator : decision === "stop" ? stopValidator : diagnosisValidator;
+	// Inspect the selected branch so unrelated branch errors do not obscure the feedback.
+	const validator =
+		decision === "repair" ? repairValidator : decision === "continue" ? continueValidator : diagnosisValidator;
 	if (!validator.Check(value)) {
 		const errors = validator.Errors(value);
 		const error =
@@ -224,14 +173,6 @@ export function parseSureDiagnosisResult(value: unknown): SureDiagnosisResult {
 		const expected = error.keyword === "type" ? `must be ${error.params.type}` : error.message;
 		throw new Error(`Invalid diagnosis: ${parts.join(".") || "root"} ${expected}; received ${actual}.`);
 	}
-	if (value.decision === "stop") {
-		if (value.stopAssessment.blockingUnknowns.length)
-			throw new Error("Stop has unresolved blockingUnknowns; continue investigation or return a checkpoint.");
-		if (
-			value.stopAssessment.evidenceReferences.some(({ reference }) => !value.evidenceReferences.includes(reference))
-		)
-			throw new Error("Stop assessment references must also appear in evidenceReferences.");
-	}
 	return {
 		runId: value.runId,
 		unitId: value.unitId,
@@ -241,13 +182,12 @@ export function parseSureDiagnosisResult(value: unknown): SureDiagnosisResult {
 		hypotheses: value.hypotheses,
 		unknowns: value.unknowns,
 		evidenceReferences: value.evidenceReferences,
-		targetFiles: value.targetFiles,
+		targetFiles: value.decision === "repair" ? value.targetFiles : undefined,
 		focusPaths: value.focusPaths,
 		validation: value.validation,
 		stopBoundary: value.stopBoundary,
 		nextActions: value.nextActions,
-		repair: value.repair,
-		stopReason: value.stopReason,
-		stopAssessment: value.decision === "stop" ? value.stopAssessment : undefined,
+		repair: value.decision === "repair" ? value.repair : undefined,
+		reason: value.decision === "continue" ? value.reason : undefined,
 	};
 }

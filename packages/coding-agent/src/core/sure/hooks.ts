@@ -12,7 +12,6 @@ import type { SureHookContext, SureHookDeclaration, SureHookPoint, SureHookResul
 type HookFunction = (context: SureHookContext) => SureHookResult | Promise<SureHookResult | undefined> | undefined;
 
 export interface SureGateResult {
-	finish?: SureHookResult["finish"];
 	check?: SureHookResult["check"];
 	checks?: NonNullable<SureHookResult["check"]>[];
 	ok: boolean;
@@ -48,19 +47,6 @@ function normalizeHookResult(value: unknown): SureHookResult {
 		return {};
 	}
 	return {
-		finish:
-			isRecord(value.finish) &&
-			(value.finish.status === "failed" || value.finish.status === "incomplete") &&
-			typeof value.finish.manifest_path === "string" &&
-			typeof value.finish.summary === "string"
-				? {
-						status: value.finish.status,
-						manifest_path: value.finish.manifest_path,
-						summary: value.finish.summary,
-						error_summary:
-							typeof value.finish.error_summary === "string" ? value.finish.error_summary : undefined,
-					}
-				: undefined,
 		check: parseSureCheckEvidence(value.check),
 		ok: typeof value.ok === "boolean" ? value.ok : undefined,
 		message: typeof value.message === "string" ? value.message : undefined,
@@ -101,7 +87,6 @@ export class SureHookRunner {
 		const declarations = this.skillPackage.manifest.hooks?.[point] ?? [];
 		let statePatch: unknown;
 		let check: SureHookResult["check"];
-		let finish: SureHookResult["finish"];
 		const checks: NonNullable<SureHookResult["check"]>[] = [];
 		const invocationId = randomUUID();
 		let invocationAttempt = 0;
@@ -156,7 +141,6 @@ export class SureHookRunner {
 			if (!result) continue;
 			if (result.check) checks.push(result.check);
 			check = result.check ?? check;
-			finish = result.finish ?? finish;
 			if (result.state_patch !== undefined) {
 				statePatch = result.state_patch;
 			}
@@ -164,7 +148,7 @@ export class SureHookRunner {
 		}
 		const gate = failure
 			? { ...failure, state_patch: failure.state_patch ?? statePatch }
-			: { ok: true, state_patch: statePatch, check, finish };
+			: { ok: true, state_patch: statePatch, check };
 		return this.skillPackage.manifest.coordination ? { ...gate, checks } : gate;
 	}
 

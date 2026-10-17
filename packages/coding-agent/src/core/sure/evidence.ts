@@ -12,6 +12,7 @@ import {
 } from "node:fs";
 import { dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import { createTwoFilesPatch } from "diff";
+import { resolveReadPath } from "../tools/path-utils.ts";
 import { SURE_COORDINATION_LIMITS, type SureCoordinationLimits } from "./coordination-types.ts";
 import type { SureRunRecord } from "./types.ts";
 
@@ -83,13 +84,36 @@ const IDENTITY_ONLY_EXTENSIONS = new Set([
 ]);
 
 export function sureEvidenceTextAllowed(path: string): boolean {
+	if (!sureDiagnosticTextAllowed(path)) return false;
+	let existing = path;
+	while (!existsSync(existing) && dirname(existing) !== existing) existing = dirname(existing);
+	const physical = resolve(realpathSync(existing), relative(existing, path));
+	return [path, physical].every((candidate) => !candidate.split(/[\\/]/).some((part) => EXCLUDED_NAMES.has(part)));
+}
+
+/** Live investigation may inspect dependency sources without widening capture or repair scope. */
+export function resolveSureDiagnosticPath(run: SureRunRecord, value: string): string {
+	if (/^(project:|run:|package:)/.test(value)) {
+		const path = resolveSureEvidencePath(run, value);
+		if (!path) throw new Error("Diagnostic path escapes its declared root.");
+		return path;
+	}
+	return resolveReadPath(value, run.cwd);
+}
+
+export function sureDiagnosticTextAllowed(path: string): boolean {
 	let existing = path;
 	while (!existsSync(existing) && dirname(existing) !== existing) existing = dirname(existing);
 	const physical = resolve(realpathSync(existing), relative(existing, path));
 	return [path, physical].every(
 		(candidate) =>
-			!candidate.split(/[\\/]/).some((part) => EXCLUDED_NAMES.has(part) || part.startsWith(".env.")) &&
-			!IDENTITY_ONLY_EXTENSIONS.has(extname(candidate).toLowerCase()),
+			!candidate
+				.split(/[\\/]/)
+				.some(
+					(part) =>
+						[".git", "auth.json", ".env", ".aws", ".ssh", ".npmrc", ".netrc"].includes(part) ||
+						part.startsWith(".env."),
+				) && !IDENTITY_ONLY_EXTENSIONS.has(extname(candidate).toLowerCase()),
 	);
 }
 
@@ -115,8 +139,8 @@ export function assertSureDiagnosticSourcesCurrent(run: SureRunRecord, readKeys:
 	}
 	for (const [value, read] of latest) {
 		if (read.source !== "file") continue;
-		const path = resolveSureEvidencePath(run, value);
-		if (!path || !sureEvidenceTextAllowed(path) || !existsSync(path) || sureHash(readFileSync(path)) !== read.sha256)
+		const path = resolveSureDiagnosticPath(run, value);
+		if (!sureDiagnosticTextAllowed(path) || !existsSync(path) || sureHash(readFileSync(path)) !== read.sha256)
 			throw new Error(
 				`Live diagnostic source changed or became unavailable: ${evidencePathName(run, value)}; reassess current evidence.`,
 			);

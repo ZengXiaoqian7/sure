@@ -1,3 +1,5 @@
+import type { ToolCallRejection } from "../tool-call-rejection.ts";
+
 /** Versioned, skill-neutral contracts. Hook success and business gate outcome are independent. */
 export interface SureCoordinationPolicy {
 	version: 1;
@@ -33,6 +35,7 @@ export interface SureToolObservation {
 	content: string | { type: string; text?: string }[];
 	isError: boolean;
 	execution?: "returned" | "skipped";
+	rejection?: ToolCallRejection;
 	duringHold?: boolean;
 }
 
@@ -40,8 +43,10 @@ export interface SureCheckEvidence {
 	unitId: string;
 	outcome: SureCheckOutcome;
 	failureKind?: SureFailureKind;
-	/** Retained skill hint; cannot remove a first error's local correction. */
-	recovery?: "local_once" | "diagnose";
+	/** Optional semantic identity supplied by the producing skill, never inferred from shell text. */
+	condition?: { id: string; target?: string; localRepair?: boolean };
+	/** The skill verified the previous blocker was resolved and a clear local next step remains. */
+	localProgress?: boolean;
 	action?: { toolCallId: string; toolName: string; path: string; batchId?: string };
 	summary: string;
 	repair?: string;
@@ -62,22 +67,12 @@ export interface SureCheckEvidence {
 
 export type SureCoordinationStatus = "executing" | "yielding" | "diagnosing" | "stopped";
 
-export interface SureStopAssessment {
-	basis: "external_blocker" | "constraint_conflict" | "no_viable_route";
-	blockingCondition: string;
-	evidenceReferences: {
-		reference: string;
-		kind: "source" | "gate_failure" | "tool_result" | "user_constraint";
-	}[];
-	continuationAssessment: string;
-	blockingUnknowns: string[];
-}
-
 export interface SureDiagnosisResult {
 	runId: string;
 	unitId: string;
 	evidenceVersion: number;
-	decision: "repair" | "stop";
+	decision: "repair" | "continue";
+	reason?: string;
 	facts: string[];
 	hypotheses: string[];
 	unknowns: string[];
@@ -90,8 +85,6 @@ export interface SureDiagnosisResult {
 	stopBoundary?: string;
 	repair?: string;
 	nextActions: string[];
-	stopReason?: string;
-	stopAssessment?: SureStopAssessment;
 }
 
 export interface SureDiagnosisAttempt {
@@ -105,14 +98,9 @@ export interface SureDiagnosisAttempt {
 	readRequests?: number;
 	elapsedMs: number;
 	result?: SureDiagnosisResult;
-	/** Set only after stop premises pass the current evidence contract. */
-	stopValidated?: boolean;
 	error?: string;
 	trigger?: string;
 	checkpoint?: SureDiagnosisCheckpoint;
-	timelineOffset?: number;
-	userContextOffset?: number;
-	timelineHash?: string;
 	readKeys?: string[];
 	segments?: { startedAt: string; modelTurns: number; readCalls: number; elapsedMs: number; error?: string }[];
 	compactionCalls?: number;
@@ -125,65 +113,42 @@ export interface SureDiagnosisAttempt {
 }
 
 /** Internal investigation continuation, never a business repair/stop. */
-export interface SureDiagnosisCheckpoint extends Omit<SureDiagnosisResult, "decision"> {
+export interface SureDiagnosisCheckpoint {
+	runId: string;
+	unitId: string;
+	evidenceVersion: number;
 	decision: "checkpoint";
 	checkpoint: string;
-	nextReads: Record<string, unknown>[];
-	candidateRange: { startBatch: string; endBatch: string } | null;
-	supportingEvidence: string[];
-	opposingEvidence: string[];
 	automatic: boolean;
 }
 
 export type SureDiagnosisOutcome = SureDiagnosisResult | SureDiagnosisCheckpoint;
 
-export interface SureUnitBudget {
-	calls?: number;
-	actions?: Record<string, number>;
-	checks: number;
-	noProgress: number;
-	directRepairs: number;
-	/** Read once when loading pre-v4 runs; never grants a fresh allowance. */
-	formatRepairs?: number;
-	supervisorRepairs: number;
-	lastFingerprint?: string;
-	progress?: { key: string; completed: number; inputFingerprint: string };
-	directRepairStalledBatches?: number;
-	directRepairProgressSinceBatch?: boolean;
-	directRepairLastBatchId?: string;
-}
-
 export interface SureRepairRecord {
 	id: string;
-	source?: "executor" | "supervisor";
+	source: "supervisor";
 	triggerCheckVersion?: number;
 	triggerBatchId?: string;
-	/** Only an associated, actually returned check can settle a correction. */
-	verificationCheckVersion?: number;
-	/** A distinct error/object discovered while pursuing this repair. */
-	parentRepairId?: string;
-	relation?: "independent" | "related";
-	toolStallHandoff?: boolean;
 	unitId: string;
 	task: string;
 	acceptedAt: string;
 	beforeSnapshotId?: string;
 	afterSnapshotId?: string;
 	checkVersions: number[];
-	outcome: SureCheckOutcome | "invalidated" | "stopped";
+	/** Original gate observation only; never proves every action in the task occurred. */
+	gateOutcome?: SureCheckOutcome;
+	gateCheckVersion?: number;
 	remainingBlocker?: string;
 	stopReason?: string;
-	remainingBudget: { kind?: "review_thresholds"; calls: number; checks: number; supervisorRepairs: number };
 }
 
 export interface SureCoordinationState {
-	version: 1;
+	version: 2;
 	runId: string;
 	status: SureCoordinationStatus;
 	unitId: string;
 	evidenceVersion: number;
 	updatedAt: string;
-	units: Record<string, SureUnitBudget>;
 	attempts: SureDiagnosisAttempt[];
 	repairs?: SureRepairRecord[];
 	limits?: SureCoordinationLimits;
@@ -192,6 +157,9 @@ export interface SureCoordinationState {
 	originalFailure?: SureCheckEvidence;
 	lastFailure?: SureCheckEvidence;
 	lastFailureCheckVersion?: number;
+	/** The current failure episode and debugger review position survive reload. */
+	unresolvedCheckVersion?: number;
+	reviewedFailureVersion?: number;
 	yieldReason?: string;
 	initialSnapshot?: string;
 	lastSuccessSnapshot?: string;
@@ -207,8 +175,10 @@ export interface SureCoordinationState {
 		delivered: boolean;
 		deliveryStarted?: boolean;
 		receiverSessionFile?: string;
+		receiverSessionId?: string;
+		receiverParentId?: string | null;
+		receiverMessageId?: string;
 	};
-	pendingDirectRepairId?: string;
 	/** Deduplicated checks per unit/tool/source or hook invocation, including resume. */
 	observedToolChecks?: Record<string, string>;
 	stopReason?: string;
@@ -225,10 +195,6 @@ export interface SureCoordinationState {
 }
 
 export const SURE_COORDINATION_LIMITS = Object.freeze({
-	diagnosesPerUnit: 3,
-	supervisorRepairsPerUnit: 2,
-	noProgressChecks: 3, // Historical setting; repeated calls/batches are observations, not handoff triggers.
-	checksPerUnit: 40,
 	finishNudges: 3,
 	snapshotFiles: 256,
 	snapshotFileBytes: 256_000,

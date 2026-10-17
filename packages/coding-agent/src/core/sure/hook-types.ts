@@ -9,7 +9,6 @@ export type SureHookPoint =
 	| "pre_tool_call"
 	| "post_tool_result"
 	| "pre_finish"
-	| "prepare_stop"
 	| "post_finish"
 	| "on_error";
 
@@ -145,7 +144,6 @@ export interface SureHookContext {
 }
 
 export interface SureHookResult {
-	finish?: SureFinishParams;
 	check?: SureCheckEvidence;
 	ok?: boolean;
 	message?: string;
@@ -166,6 +164,8 @@ export interface SureFinishParams {
 }
 
 export interface SureFinishDetails {
+	/** Actual manifest validation phase; does not change finish acceptance. */
+	rejection?: "manifest_path" | "manifest_json" | "manifest_envelope";
 	runId?: string;
 	status?: SureRunStatus;
 	accepted: boolean;

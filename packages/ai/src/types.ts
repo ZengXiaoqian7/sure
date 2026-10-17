@@ -152,14 +152,6 @@ export interface ProviderRequestOptions<TModel = Model<Api>> {
 }
 
 export interface StreamOptions extends ProviderRequestOptions<Model<Api>> {
-	/** Observe OpenAI completions usage at ingress, including ignored choice-level usage. */
-	onOpenAICompletionsUsage?: (event: {
-		source: "chunk.usage" | "choice.usage";
-		chunkIndex: number;
-		usage: unknown;
-		applied: boolean;
-		normalized: Usage;
-	}) => void;
 	/**
 	 * Optional callback invoked after an HTTP response is received and before
 	 * its body stream is consumed.

@@ -4,7 +4,6 @@
 	"description": "Onboard or repair a model, validate its inference contract, and seal either a digest-pinned container or a site-approved local Python Eval binding.",
 	"prompt": "SKILL.md",
 	"hooks": {
-		"prepare_stop": [{ "module": "hooks/stop.ts", "handler": "prepareStop" }],
 		"pre_start": [
 			{
 				"module": "hooks/index.ts",
@@ -115,10 +114,6 @@
 	"coordination": {
 		"version": 1,
 		"budgets": {
-			"supervisorRepairsPerUnit": 2,
-			"diagnosesPerUnit": 3,
-			"noProgressChecks": 3,
-			"checksPerUnit": 40,
 			"finishNudges": 3
 		},
 		"commonPrompt": "prompts/common.md",

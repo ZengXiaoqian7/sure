@@ -121,9 +121,9 @@ export function buildSureCommonPrompt(skill: SureSkillPackage, run: SureRunRecor
 		`Run inputs and global constraints: ${run.args}`,
 		`Runtime paths (absolute): ${JSON.stringify({ projectRoot: run.cwd, packageDir: run.packageDir, runDir: run.runDir })}`,
 		"Historical passed checks identify prior outputs, not current existence. Pending, skipped and tool success are not validation; use recorded paths, never infer filenames from unit IDs.",
-		"For a supervisor task, preserve its complete goal and original permissions. focusPaths and discovered-object lists are investigation hints, not a write allowlist. Choose supporting reads, probes and corrections. Verify newly discovered related objects within that goal; return when its original condition actually still fails, the goal changes, or dependency counterevidence prevents a safe decision.",
-		"Each independent error has one local correction, including errors inside a supervisor task. Correct the actual feedback, then test its original condition. Other commands' success/failure, changed wording/input, and reload do not settle or renew that correction. The original gate remains authoritative.",
-		"When a result cannot be associated automatically, use sure_update_state with repair_verification={repair_id,check_version,relation}. Use recheck only for an actual test of the original condition; independent for a distinct error; related for another object within the same goal. Cite a retained check version, never a claimed outcome. Unrelated successful commands cannot prove a repair. Pending/unchanged business checks are not failed rechecks. Preserve unresolved source IDs; do not relabel an old failure as independent merely because its text or command changed.",
+		"Preserve the supervisor task's complete goal, original permissions and required runtime dependencies. focusPaths are investigation hints, not a write allowlist. Related objects remain within the original goal; the unchanged original gate determines business progression.",
+		"Correct clear local problems directly. The harness requests supervision when actual correction remains blocked without verified local progress. Changed error wording or commands alone do not prove progress; original check results remain authoritative.",
+		"Follow the supervisor guidance as one complete goal, including supporting probes and corrections. A successful probe is not a business gate pass. Continue normally after the original gate passes; no return for supervisor approval is required.",
 	].join("\n\n");
 }
 
@@ -153,11 +153,7 @@ export function planSureContextTrim(
 	for (const { check, version } of checks) {
 		if (
 			check.unitId === (coordination.stageUnitId ?? coordination.unitId) ||
-			coordination.repairs?.some(
-				(repair) =>
-					repair.triggerCheckVersion === version &&
-					!["passed", "skipped", "invalidated", "stopped"].includes(repair.outcome),
-			)
+			coordination.unresolvedCheckVersion === version
 		) {
 			if (check.action) required.add(check.action.toolCallId);
 			for (const path of [...check.inputPaths, ...check.artifactPaths])

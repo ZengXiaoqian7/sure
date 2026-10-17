@@ -24,7 +24,6 @@ const HOOK_POINTS = new Set<SureHookPoint>([
 	"pre_tool_call",
 	"post_tool_result",
 	"pre_finish",
-	"prepare_stop",
 	"post_finish",
 	"on_error",
 ]);

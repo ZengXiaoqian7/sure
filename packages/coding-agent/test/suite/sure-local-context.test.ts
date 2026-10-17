@@ -30,7 +30,8 @@ const run: SureRunRecord = {
 	startedAt: "now",
 	updatedAt: "now",
 };
-const clauses = new Map([...skill.prompt.matchAll(/^- \*\*([^*]+)\*\*: (.+)$/gm)].map((match) => [match[1], match[2]]));
+const baseline = readFileSync(new URL("../fixtures/sure/onboard-baseline-skill.md", import.meta.url), "utf8");
+const clauses = new Map([...baseline.matchAll(/^- \*\*([^*]+)\*\*: (.+)$/gm)].map((match) => [match[1], match[2]]));
 const sharedSections = [
 	["### Command Boundaries", "### Local-first discovery"],
 	["### Environment Boundary", "For explicit local `package=none`"],
@@ -40,47 +41,57 @@ const sharedSections = [
 	["## Product Layout", "## Backend\n"],
 	["## Backend\n", "## Failure Handling"],
 	["## Memory (advisory)", "## Success Criteria"],
-].map(([start, end]) => {
-	const from = skill.prompt.indexOf(start);
-	const to = skill.prompt.indexOf(end, from);
-	if (from < 0 || to <= from) throw new Error(`Missing manual section: ${start}`);
-	return skill.prompt.slice(from, to).trim();
-});
+].map(([start, end]) => baseline.slice(baseline.indexOf(start), baseline.indexOf(end)).trim());
 
-describe("onboard stage instruction boundaries", () => {
-	it("keeps original consumer sources available for failure-specific read-only diagnosis", () => {
-		for (const unit of ["generate_wrapper", "validate_contract", "finalize_model_bundle"]) {
-			const stage = skill.manifest.coordination!.stages.find((stage) => stage.id === unit)!;
-			expect(stage.diagnosticPaths).toContain("project:sure/skills/sure_infer/scripts/server_protocol.py");
-			expect(stage.diagnosticPaths).toContain(
-				"project:sure/skills/sure_infer/scripts/generate_predictions_via_server.py",
-			);
-		}
+describe("baseline-equivalent local instructions", () => {
+	it("keeps the complete supervisor manual free of an added routine service checklist", () => {
+		const currentClauses = [...skill.prompt.matchAll(/^- \*\*([^*]+)\*\*: (.+)$/gm)].map((match) => [
+			match[1],
+			match[2],
+		]);
+		expect(currentClauses).toEqual([...clauses]);
+		expect(skill.prompt).toContain("supervisor first investigates existing actions");
+		expect(skill.prompt).not.toContain("First probe the original consumer");
 	});
-	it.each(skill.manifest.coordination!.stages)(
-		"retains the full manual's clause and shared rules for $id",
-		(stage) => {
-			const prompt =
-				buildSureCommonPrompt(skill, run) +
-				"\n" +
-				buildSureStagePrompt(skill, run, {
-					checkpoint: { id: "main_flow", data: { currentUnit: stage.id } },
-				});
-			const key = ["validate_import", "validate_load", "validate_infer", "validate_contract"].includes(stage.id)
-				? "validate_import/load/infer/contract"
-				: stage.id;
-			expect(clauses.get(key)).toBeTruthy();
-			expect(prompt).toContain(`Full operating manual entry point: ${join(packageDir, "SKILL.md")}`);
-			expect(prompt).toContain(clauses.get(key));
-			for (const section of sharedSections) expect(prompt).toContain(section);
-			expect(prompt).toContain(
-				"after two consecutive gate failures (`max_retries=` can raise that number, never lower it)",
-			);
-			const authored = readFileSync(join(packageDir, stage.prompt), "utf8");
-			const stageClauses = [...authored.matchAll(/^- \*\*([^*]+)\*\*: (.+)$/gm)];
-			expect(stageClauses.map((match) => match[2])).toEqual([clauses.get(key)]);
-			expect(prompt).toContain("max_retries=5");
-			expect(surePromptPaths(skill, stage.id)).toContain("package:SKILL.md");
-		},
-	);
+	it.each(skill.manifest.coordination!.stages)("retains the complete baseline clause for $id", (stage) => {
+		const prompt =
+			buildSureCommonPrompt(skill, run) +
+			"\n" +
+			buildSureStagePrompt(skill, run, {
+				checkpoint: { id: "main_flow", data: { currentUnit: stage.id } },
+			});
+		const key = ["validate_import", "validate_load", "validate_infer", "validate_contract"].includes(stage.id)
+			? "validate_import/load/infer/contract"
+			: stage.id;
+		expect(clauses.get(key)).toBeTruthy();
+		expect(prompt).toContain(`Full operating manual entry point: ${join(packageDir, "SKILL.md")}`);
+		expect(prompt).toContain(clauses.get(key));
+		for (const section of sharedSections) expect(prompt).toContain(section);
+		expect(prompt).toContain(
+			"after two consecutive gate failures (`max_retries=` can raise that number, never lower it)",
+		);
+		const authored = readFileSync(join(packageDir, stage.prompt), "utf8");
+		const stageClauses = [...authored.matchAll(/^- \*\*([^*]+)\*\*: (.+)$/gm)];
+		expect(stageClauses.map((match) => match[2])).toEqual([clauses.get(key)]);
+		for (const extra of [
+			"Use the original consumer",
+			"Also verify service delivery",
+			"Before sealing, confirm the service checks",
+			"Service delivery must match",
+			"service delivery verification",
+		])
+			expect(prompt).not.toContain(extra);
+		for (const rule of [
+			"Parameters",
+			"Product Layout",
+			"Model-Local Checkpoint Rule",
+			"metric enrichment reference",
+			"failure_taxonomy.md",
+			"retry_and_escalation.md",
+			"max_retries=5",
+		])
+			expect(prompt).toContain(rule);
+		expect(prompt).not.toContain("Read the current schema and relevant reference entry points before");
+		expect(surePromptPaths(skill, stage.id)).toContain("package:SKILL.md");
+	});
 });

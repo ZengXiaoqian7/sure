@@ -187,6 +187,7 @@ export function validateProduces(ctx: SureHookContext, unit: Unit, artifact: unk
 				ok: false,
 				repair: `${unit.produces} is missing required field "${field}" (unit "${unit.id}"). Expected ${field}: ${describeExpected(spec)}. Full expected shape: ${describeSchemaSummary(ctx, unit)}.`,
 				reason: `missing field ${field}`,
+				condition: { id: "required_field", target: field, localRepair: true },
 			};
 		}
 	}

@@ -32,13 +32,12 @@ export function buildSureFailureReport(
 	display?: SureDisplayState,
 ): SureFailureReport {
 	const state: SureCoordinationState = coordinator?.state ?? {
-		version: 1,
+		version: 2,
 		runId: run.runId,
 		status: "stopped",
 		unitId: display?.phase?.id ?? "startup",
 		evidenceVersion: 0,
 		updatedAt: run.updatedAt,
-		units: {},
 		attempts: [],
 		stopReason: run.lastRepair ?? run.errorSummary,
 	};
@@ -96,11 +95,11 @@ export function buildSureFailureReport(
 		attempted: [
 			...state.attempts.map(
 				(attempt) =>
-					`${attempt.id}: ${attempt.trigger ? `Triggered by ${attempt.trigger}. ` : ""}${attempt.error ?? attempt.result?.repair ?? attempt.result?.stopReason ?? "interrupted diagnosis"}`,
+					`${attempt.id}: ${attempt.trigger ? `Triggered by ${attempt.trigger}. ` : ""}${attempt.error ?? attempt.result?.repair ?? attempt.result?.reason ?? "interrupted diagnosis"}`,
 			),
 			...(state.repairs ?? []).map(
 				(repair) =>
-					`Repair ${repair.id}: ${repair.task}; outcome ${repair.outcome}; checks ${repair.checkVersions.map((version) => `check:${version}`).join(", ") || "not yet executed"}; snapshots ${repair.beforeSnapshotId ?? "unavailable"} -> ${repair.afterSnapshotId ?? "unavailable"}; remaining blocker: ${repair.remainingBlocker ?? "none recorded"}${repair.stopReason ? `; ${repair.stopReason}` : ""}`,
+					`Task ${repair.id}: ${repair.task}; original gate ${repair.gateOutcome ?? "not recorded"}; checks ${repair.checkVersions.map((version) => `check:${version}`).join(", ") || "not yet executed"}; snapshots ${repair.beforeSnapshotId ?? "unavailable"} -> ${repair.afterSnapshotId ?? "unavailable"}; remaining blocker: ${repair.remainingBlocker ?? "none recorded"}${repair.stopReason ? `; ${repair.stopReason}` : ""}`,
 			),
 		],
 		stopReason:
@@ -157,7 +156,7 @@ export function renderSureFailureReport(report: SureFailureReport, expanded = tr
 		`Stage: ${report.stageLabel ?? report.stage} (${report.stage})\nReference: ${report.reference}\nDiagnosis: ${diagnosis}`,
 		`Confirmed facts:\n${report.facts.join("\n") || "None recorded."}\nHypotheses:\n${report.hypotheses.join("\n") || "None."}\nUnknowns:\n${report.unknowns.join("\n") || "None recorded."}`,
 		`Attempted fixes/diagnoses:\n${report.attempted.join("\n") || "None."}\nStop reason: ${report.stopReason}`,
-		`Next actions:\n${report.nextActions.join("\n")}\n${report.resumable ? `Saved checkpoint: ${report.resumeCommand}; budgets and history remain in effect.` : "No resumable checkpoint is available."}`,
+		`Next actions:\n${report.nextActions.join("\n")}\n${report.resumable ? `Saved checkpoint: ${report.resumeCommand}; original checks and history remain in effect.` : "No resumable checkpoint is available."}`,
 		`Diagnosis references (existence checked; not proof of cause):\n${report.diagnosisEvidence.join("\n") || "No validated model diagnosis."}\nEvidence:\n${report.evidencePaths.join("\n")}`,
 	].join("\n\n");
 }

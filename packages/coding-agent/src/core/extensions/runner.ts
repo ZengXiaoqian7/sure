@@ -253,6 +253,7 @@ export async function emitProjectTrustEvent(
 }
 
 export const noOpUIContext: ExtensionUIContext = {
+	showAgentActivity: () => {},
 	select: async () => undefined,
 	confirm: async () => false,
 	input: async () => undefined,

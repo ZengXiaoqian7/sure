@@ -14,11 +14,11 @@ import { SureRunManager } from "../../src/core/sure/run-manager.ts";
 import { syncSureUserContext } from "../../src/core/sure/user-context.ts";
 import { createHarness, getMessageText, type Harness } from "./harness.ts";
 import {
+	continueExecution,
 	fixtureTranscript,
 	pauseDiagnosis,
 	repairHandoff,
 	submitControlFixture,
-	toolReply,
 } from "./sure-control-fixtures.ts";
 
 const harnesses: Harness[] = [];
@@ -62,13 +62,15 @@ async function setup(
 		multipleChecks?: boolean;
 		complexSubcheck?: "first" | "last";
 		factoryError?: boolean;
-		decision?: "repair" | "pause";
+		decision?: "repair" | "pause" | "continue";
 		parallel?: boolean;
+		longReads?: boolean;
 		longErrors?: boolean;
 		priorStages?: boolean;
 		twoStages?: boolean;
 		delayGate?: boolean;
 		delayFinish?: boolean;
+		preflightReject?: boolean;
 		duringDiagnosis?: (harness: Harness) => void | Promise<void>;
 		onTimeline?: (timeline: string) => void;
 		onDiagnosisPrompt?: (prompt: string) => void;
@@ -76,6 +78,7 @@ async function setup(
 ) {
 	let harness: Harness;
 	let diagnoses = 0;
+	const diagnosisSessions: string[] = [];
 	const executed: string[] = [];
 	const completed: string[] = [];
 	const workParams = Type.Object({ value: Type.String() });
@@ -122,7 +125,7 @@ async function setup(
 				content: [
 					{
 						type: "text",
-						text: `Original output ${value}`,
+						text: `Original output ${value}${options.longReads ? "\nLarge dependency evidence".repeat(2000) : ""}`,
 					},
 				],
 				details: {},
@@ -141,11 +144,12 @@ async function setup(
 				"sure_diagnostic_read",
 				"sure_handoff_repair",
 				"sure_pause_diagnosis",
+				"sure_continue_execution",
 			]);
 			const transcript = fixtureTranscript(request, harness.tempDir);
+			diagnosisSessions.push(transcript.manager.getSessionId());
 			return {
 				getSessionIdentity: transcript.getSessionIdentity,
-				disableTools: () => {},
 				prompt: async (prompt) => {
 					transcript.manager.appendMessage({ role: "user", content: prompt, timestamp: Date.now() });
 					options.onDiagnosisPrompt?.(`${request.systemPrompt}\n${prompt}`);
@@ -175,7 +179,9 @@ async function setup(
 						harness.session.extensionRunner.createContext(),
 						options.decision === "pause"
 							? pauseDiagnosis("More diagnostic evidence is needed; retain the current checkpoint.")
-							: repairHandoff("Repair the current artifact and rerun its original gate."),
+							: options.decision === "continue"
+								? continueExecution("The existing route remains viable.")
+								: repairHandoff("Repair the current artifact and rerun its original gate.", undefined),
 					);
 				},
 				abort: async () => {},
@@ -202,9 +208,10 @@ import { join } from "node:path";
 export function resolved(ctx) { writeFileSync(join(ctx.runDir,"artifacts/request.json"),"{}"); return {ok:true,check:{unitId:"resolve",outcome:"passed",summary:"Fixture request resolved",inputPaths:[],artifactPaths:["run:artifacts/request.json"]}}; }
 export function selected(ctx) { writeFileSync(join(ctx.runDir,"artifacts/context.json"),"{}"); return {ok:true,check:{unitId:"context",outcome:"passed",summary:"Fixture context selected",inputPaths:[],artifactPaths:["run:artifacts/context.json"]}}; }
 export function preStart() { return { ok:true, state_patch:{ phase:{id:"stage",status:"running"}, checkpoint:{resumable:true,data:{currentUnit:"stage",completedUnits:[]}} } }; }
+export function preflight(ctx) { return ctx.event.input.value?.startsWith("reject") ? {ok:false,repair:"Correct the rejected value."} : {ok:true}; }
 export async function postToolResult(ctx) {
  ${options.delayGate ? 'writeFileSync(join(ctx.runDir,"gate-started"),"started"); await new Promise(resolve=>setTimeout(resolve,50));' : ""}
- if(ctx.event.isError) return {ok:true,check:{unitId:"stage",outcome:"blocked",failureKind:"tool",recovery:"local_once",summary:"Execution tool failed",repair:"Inspect and correct the call.",artifactPaths:["run:artifacts/current.json"],inputPaths:[]}};
+ if(ctx.event.isError) return {ok:true,check:{unitId:"stage",outcome:"blocked",failureKind:"tool",summary:"Execution tool failed",repair:"Inspect and correct the call.",artifactPaths:["run:artifacts/current.json"],inputPaths:[]}};
  const file=join(ctx.runDir,"artifacts/current.json");
  const value=existsSync(file)?JSON.parse(readFileSync(file,"utf8")).value:"pending";
  const check={unitId:"stage",outcome:value==="good"?"passed":value==="pending"?"pending":"blocked",failureKind:value==="format"?"format":"semantic",summary:"Gate saw "+value,artifactPaths:["run:artifacts/current.json"],inputPaths:[]};
@@ -223,10 +230,7 @@ export function passingSubcheck() {
 export function complexSubcheck() {
  return {ok:true,check:{unitId:"stage",outcome:"blocked",failureKind:"semantic",summary:"Independent semantic blocker",artifactPaths:[],inputPaths:[]}};
 }
-export function prepareStop(ctx) {
- writeFileSync(join(ctx.runDir,"artifacts/stopped.json"),"UNEXPECTED_TERMINALIZATION");
- throw new Error("A diagnostic pause must not terminalize the business task.");
-}
+
 `,
 	);
 	json(join(skillDir, "sure.skill.json"), {
@@ -248,6 +252,7 @@ export function prepareStop(ctx) {
 			})),
 		},
 		hooks: {
+			...(options.preflightReject ? { pre_tool_call: [{ module: "hooks.ts", handler: "preflight" }] } : {}),
 			pre_start: [...(options.priorStages ? ["resolved", "selected"] : []), "preStart"].map((handler) => ({
 				module: "hooks.ts",
 				handler,
@@ -259,7 +264,6 @@ export function prepareStop(ctx) {
 				...(options.complexSubcheck === "last" ? ["complexSubcheck"] : []),
 			].map((handler) => ({ module: "hooks.ts", handler })),
 			pre_finish: [{ module: "hooks.ts", handler: "preFinish" }],
-			prepare_stop: [{ module: "hooks.ts", handler: "prepareStop" }],
 		},
 	});
 	await harness.session.bindExtensions({
@@ -269,17 +273,21 @@ export function prepareStop(ctx) {
 		},
 	});
 	const finish = () =>
-		toolReply(
-			fauxToolCall("sure_finish", {
-				status: "success",
-				manifest_path: join(runDir(harness), "manifest.json"),
-				summary: "Validated task",
-			}),
+		fauxAssistantMessage(
+			[
+				fauxToolCall("sure_finish", {
+					status: "success",
+					manifest_path: join(runDir(harness), "manifest.json"),
+					summary: "Validated task",
+				}),
+			],
+			{ stopReason: "toolUse" },
 		);
 	return {
 		harness,
 		executed,
 		completed,
+		diagnosisSessions,
 		get diagnoses() {
 			return diagnoses;
 		},
@@ -292,7 +300,7 @@ afterEach(() => {
 	for (const harness of harnesses.splice(0)) harness.cleanup();
 });
 
-function seedInterruptedRun(harness: Harness): SureCoordinator {
+function seedInterruptedRun(harness: Harness, failureKind: "semantic" | "tool" = "semantic"): SureCoordinator {
 	const manager = new SureRunManager(harness.tempDir);
 	const skill = discoverSureSkillPackages(harness.tempDir).packages[0];
 	const run = manager.createRun(skill, "model=demo device=cuda");
@@ -307,17 +315,161 @@ function seedInterruptedRun(harness: Harness): SureCoordinator {
 		{
 			unitId: "stage",
 			outcome: "blocked",
-			failureKind: "semantic",
+			failureKind,
 			summary: "Gate saw bad",
 			inputPaths: [],
 			artifactPaths: ["run:artifacts/current.json"],
 		},
 		["run:artifacts", ...surePromptPaths(skill, "stage")],
 	);
+	coordinator.requestDiagnosis("Interrupted fixture needs investigation.");
 	return coordinator;
 }
 
 describe("Sure executor/supervisor handoff", () => {
+	it("automatically diagnoses a failed correction without an executor help signal", async () => {
+		const fixture = await setup();
+		fixture.harness.setResponses([
+			fauxAssistantMessage([fauxToolCall("work", { value: "tool-error" })], { stopReason: "toolUse" }),
+			fauxAssistantMessage([fauxToolCall("work", { value: "tool-error-again" })], { stopReason: "toolUse" }),
+			fauxAssistantMessage([fauxToolCall("work", { value: "good" })], { stopReason: "toolUse" }),
+			() => fixture.finish(),
+		]);
+		await fixture.harness.session.prompt("/sure_feed model=demo");
+		expect(fixture.diagnoses).toBe(1);
+		expect(fixture.executed).toEqual(["tool-error", "tool-error-again", "good"]);
+		expect(state(fixture.harness).repairs).toHaveLength(1);
+		expect(JSON.parse(readFileSync(join(runDir(fixture.harness), "run.json"), "utf8")).status).toBe("success");
+	});
+
+	it("returns a continue decision to the executor without creating a repair", async () => {
+		const fixture = await setup({ decision: "continue" });
+		let executorContext = "";
+		fixture.harness.setResponses([
+			...Array.from({ length: 2 }, () =>
+				fauxAssistantMessage([fauxToolCall("work", { value: "bad" })], { stopReason: "toolUse" }),
+			),
+			(context) => {
+				executorContext = context.messages.map(getMessageText).join("\n");
+				return fauxAssistantMessage([fauxToolCall("work", { value: "good" })], { stopReason: "toolUse" });
+			},
+			() => fixture.finish(),
+		]);
+		await fixture.harness.session.prompt("/sure_feed model=demo");
+		expect(fixture.diagnoses).toBe(1);
+		expect(executorContext).toContain("The existing route remains viable.");
+		expect(executorContext).toContain("without returning for supervisor approval");
+		expect(state(fixture.harness).repairs ?? []).toHaveLength(0);
+		expect(state(fixture.harness).attempts[0].result).toMatchObject({ decision: "continue" });
+		expect(fixture.executed).toEqual(["bad", "bad", "good"]);
+	});
+
+	it.each(["arguments", "preflight", "control"] as const)(
+		"automatically investigates continued %s rejection after feedback, without double-counting one batch",
+		async (rejection) => {
+			const fixture = await setup({ preflightReject: rejection === "preflight" });
+			const rejected = () =>
+				rejection === "control"
+					? fauxToolCall("sure_update_state", { phase: { status: "success" } })
+					: fauxToolCall("work", rejection === "arguments" ? { missing: true } : { value: "reject-this" });
+			let firstBatchDiagnoses = -1;
+			fixture.harness.setResponses([
+				fauxAssistantMessage([rejected(), rejected()], { stopReason: "toolUse" }),
+				() => {
+					firstBatchDiagnoses = fixture.diagnoses;
+					return fauxAssistantMessage([rejected()], { stopReason: "toolUse" });
+				},
+				fauxAssistantMessage([fauxToolCall("work", { value: "good" })], { stopReason: "toolUse" }),
+				() => fixture.finish(),
+			]);
+			await fixture.harness.session.prompt("/sure_feed model=demo");
+			expect(firstBatchDiagnoses).toBe(0);
+			expect(fixture.diagnoses).toBe(1);
+			expect(fixture.executed).toEqual(["good"]);
+			expect(state(fixture.harness).repairs).toHaveLength(1);
+			const actions = readdirSync(join(runDir(fixture.harness), "evidence/tools")).map((name) =>
+				JSON.parse(readFileSync(join(runDir(fixture.harness), "evidence/tools", name), "utf8")),
+			);
+			const failures = actions.filter((action) => action.isError);
+			expect(failures).toHaveLength(3);
+			expect(
+				failures.every((action) => action.execution === (rejection === "control" ? "returned" : "skipped")),
+			).toBe(true);
+			if (rejection !== "control") expect(failures.every((action) => action.rejection === rejection)).toBe(true);
+		},
+	);
+
+	it("leaves a corrected first argument rejection with the executor", async () => {
+		const fixture = await setup();
+		fixture.harness.setResponses([
+			fauxAssistantMessage([fauxToolCall("work", { missing: true })], { stopReason: "toolUse" }),
+			fauxAssistantMessage([fauxToolCall("work", { value: "good" })], { stopReason: "toolUse" }),
+			() => fixture.finish(),
+		]);
+		await fixture.harness.session.prompt("/sure_feed model=demo");
+		expect(fixture.diagnoses).toBe(0);
+		expect(fixture.executed).toEqual(["good"]);
+		expect(state(fixture.harness).unresolvedCheckVersion).toBeUndefined();
+	});
+
+	it("investigates a new rejected attempt after continue without replaying reviewed evidence", async () => {
+		const fixture = await setup({ decision: "continue" });
+		fixture.harness.setResponses([
+			...Array.from({ length: 3 }, () =>
+				fauxAssistantMessage([fauxToolCall("work", { missing: true })], { stopReason: "toolUse" }),
+			),
+			fauxAssistantMessage([fauxToolCall("work", { value: "good" })], { stopReason: "toolUse" }),
+			() => fixture.finish(),
+		]);
+		await fixture.harness.session.prompt("/sure_feed model=demo");
+		expect(fixture.diagnoses).toBe(2);
+		expect(new Set(fixture.diagnosisSessions).size).toBe(1);
+		expect(state(fixture.harness).repairs).toHaveLength(0);
+	});
+
+	it.each(["arguments", "preflight"] as const)(
+		"does not let an unrelated supporting success clear a %s rejection",
+		async (rejection) => {
+			const fixture = await setup({ decision: "pause", preflightReject: rejection === "preflight" });
+			fixture.harness.setResponses([
+				fauxAssistantMessage(
+					[fauxToolCall("work", rejection === "arguments" ? { missing: true } : { value: "reject" })],
+					{ stopReason: "toolUse" },
+				),
+				fauxAssistantMessage([fauxToolCall("work", { value: "inspect" })], { stopReason: "toolUse" }),
+				fauxAssistantMessage(
+					[fauxToolCall("work", { value: rejection === "arguments" ? "tool-error-new" : "reject" })],
+					{ stopReason: "toolUse" },
+				),
+				fauxAssistantMessage("Inspect the new failure before correcting it."),
+			]);
+			await fixture.harness.session.prompt("/sure_feed model=demo");
+			expect(fixture.diagnoses).toBe(1);
+			expect(fixture.executed).toEqual(rejection === "arguments" ? ["inspect", "tool-error-new"] : ["inspect"]);
+			expect(state(fixture.harness).lastFailure?.summary).toContain(
+				rejection === "arguments" ? "tool-error-new" : "Correct the rejected value",
+			);
+		},
+	);
+
+	it("does not treat removed help or evidence controls as valid state updates", async () => {
+		const fixture = await setup();
+		fixture.harness.setResponses([
+			fauxAssistantMessage([fauxToolCall("sure_update_state", { request_diagnosis: true })], {
+				stopReason: "toolUse",
+			}),
+			fauxAssistantMessage("Wait after the original refusal."),
+		]);
+		await fixture.harness.session.prompt("/sure_feed model=demo");
+		expect(fixture.diagnoses).toBe(0);
+		expect(
+			fixture.harness.session.messages
+				.filter((message) => message.role === "toolResult")
+				.map(getMessageText)
+				.join("\n"),
+		).toContain("not supported");
+	});
+
 	it("appends one stage change after complete tool batches and keeps unchanged request prefixes", async () => {
 		const fixture = await setup({ twoStages: true });
 		const requests: unknown[][] = [];
@@ -325,17 +477,20 @@ describe("Sure executor/supervisor handoff", () => {
 		fixture.harness.setResponses([
 			(context) => {
 				capture(context);
-				return toolReply(fauxToolCall("work", { value: "inspect-one" }));
+				return fauxAssistantMessage([fauxToolCall("work", { value: "inspect-one" })], { stopReason: "toolUse" });
 			},
 			(context) => {
 				capture(context);
-				return toolReply(fauxToolCall("work", { value: "inspect-two" }));
+				return fauxAssistantMessage([fauxToolCall("work", { value: "inspect-two" })], { stopReason: "toolUse" });
 			},
 			(context) => {
 				capture(context);
-				return toolReply(
-					fauxToolCall("work", { value: "good" }, { id: "change-a" }),
-					fauxToolCall("work", { value: "inspect" }, { id: "change-b" }),
+				return fauxAssistantMessage(
+					[
+						fauxToolCall("work", { value: "good" }, { id: "change-a" }),
+						fauxToolCall("work", { value: "inspect" }, { id: "change-b" }),
+					],
+					{ stopReason: "toolUse" },
 				);
 			},
 			(context) => {
@@ -357,8 +512,6 @@ describe("Sure executor/supervisor handoff", () => {
 			expect(final.findIndex((message) => message.toolCallId === id)).toBeLessThan(stageIndex);
 		expect(fixture.harness.eventsOfType("agent_start")).toHaveLength(1);
 		expect(fixture.diagnoses).toBe(0);
-		expect(JSON.stringify(final)).not.toContain("FULL_MANUAL_MUST_NOT_BE_INJECTED");
-		expect(JSON.parse(readFileSync(join(runDir(fixture.harness), "run.json"), "utf8")).status).toBe("success");
 	});
 
 	it("restores complete contracts, user constraints and the same passed supervisor body after compaction and reload", async () => {
@@ -404,15 +557,82 @@ describe("Sure executor/supervisor handoff", () => {
 		await fixture.harness.session.extensionRunner.emit({ type: "session_shutdown", reason: "reload" });
 		fixture.harness.setResponses([check]);
 		await fixture.harness.session.prompt(`/sure_resume ${coordinator.run.runId}`);
-		expect(state(fixture.harness).units.stage.supervisorRepairs).toBe(1);
+		expect(state(fixture.harness).repairs?.length ?? 0).toBe(1);
 		expect(state(fixture.harness).repairs!.filter((repair) => repair.id === id)).toHaveLength(1);
 		expect(fixture.diagnoses).toBe(0);
+	});
+
+	it("trims obsolete bulk at compaction and then preserves the new prefix", async () => {
+		const fixture = await setup({ twoStages: true, longReads: true });
+		fixture.harness.setResponses([
+			fauxAssistantMessage([fauxToolCall("work", { value: "inspect-earlier" }, { id: "old-bulk" })], {
+				stopReason: "toolUse",
+			}),
+			fauxAssistantMessage([fauxToolCall("work", { value: "good" })], { stopReason: "toolUse" }),
+			fauxAssistantMessage("Ready to finish after reviewing the next contract."),
+		]);
+		await fixture.harness.session.prompt("/sure_feed device=cpu");
+		fixture.harness.settingsManager.applyOverrides({ compaction: { keepRecentTokens: 500, reserveTokens: 1000 } });
+		fixture.harness.setResponses(
+			Array.from({ length: 2 }, () => fauxAssistantMessage("Retain selected CPU and finish goal.")),
+		);
+		await fixture.harness.session.compact();
+		const requests: unknown[][] = [];
+		fixture.harness.setResponses(
+			Array.from({ length: 2 }, () => (context) => {
+				requests.push(JSON.parse(JSON.stringify(context.messages)));
+				expect(JSON.stringify(context.messages)).toContain("NEXT_COMPLETE_CONTRACT");
+				expect(JSON.stringify(context.messages)).not.toContain("Large dependency evidence".repeat(100));
+				return fauxAssistantMessage("Still applying the same goal.");
+			}),
+		);
+		await fixture.harness.session.prompt("Continue");
+		await fixture.harness.session.prompt("Continue again");
+		expect(requests[1].slice(0, requests[0].length)).toEqual(requests[0]);
+		expect(JSON.stringify(fixture.harness.sessionManager.getBranch())).toContain("Large dependency evidence");
+		const trim = fixture.harness.sessionManager
+			.getBranch()
+			.filter((entry) => entry.type === "custom" && entry.customType === "sure.context.trim");
+		expect(trim).toHaveLength(1);
+		expect(JSON.stringify(trim)).toContain("old-bulk");
+	});
+
+	it("restores concrete continue guidance after lossy compaction and reload without a new investigation", async () => {
+		const fixture = await setup({ decision: "continue" });
+		fixture.harness.setResponses([
+			...Array.from({ length: 2 }, () =>
+				fauxAssistantMessage([fauxToolCall("work", { value: "bad" })], { stopReason: "toolUse" }),
+			),
+			fauxAssistantMessage("Await further work on the existing route."),
+		]);
+		await fixture.harness.session.prompt("/sure_feed model=demo");
+		const runId = state(fixture.harness).runId;
+		fixture.harness.settingsManager.applyOverrides({ compaction: { keepRecentTokens: 1, reserveTokens: 1000 } });
+		fixture.harness.setResponses(
+			Array.from({ length: 2 }, () => fauxAssistantMessage("Summary omits the supervisor guidance.")),
+		);
+		await fixture.harness.session.compact();
+		await fixture.harness.session.extensionRunner.emit({ type: "session_shutdown", reason: "reload" });
+		let effective = "";
+		fixture.harness.setResponses([
+			(context) => {
+				effective = context.messages.map(getMessageText).join("\n");
+				return fauxAssistantMessage("Continue the existing route.");
+			},
+		]);
+		await fixture.harness.session.prompt(`/sure_resume ${runId}`);
+		expect(effective).toContain("The existing route remains viable.");
+		expect(effective).toContain("Retained guidance from the same investigation");
+		expect(fixture.diagnoses).toBe(1);
+		expect(state(fixture.harness).repairs).toHaveLength(0);
 	});
 
 	it("keeps full unresolved feedback and its source after a lossy native summary", async () => {
 		const fixture = await setup({ longErrors: true });
 		fixture.harness.setResponses([
-			toolReply(fauxToolCall("work", { value: "tool-error" }, { id: "unresolved" })),
+			fauxAssistantMessage([fauxToolCall("work", { value: "tool-error" }, { id: "unresolved" })], {
+				stopReason: "toolUse",
+			}),
 			fauxAssistantMessage("Investigate before original-condition verification."),
 		]);
 		await fixture.harness.session.prompt("/sure_feed device=cpu");
@@ -442,7 +662,66 @@ describe("Sure executor/supervisor handoff", () => {
 			"<sure_invocation>Continue after native compaction.</sure_invocation>",
 		);
 		expect(fixture.diagnoses).toBe(0);
-		expect(state(fixture.harness).units.stage.directRepairs).toBe(1);
+		expect(state(fixture.harness).repairs ?? []).toHaveLength(0);
+	});
+
+	it("continues the executor's drafted next step through pending research without a stall handoff", async () => {
+		let fixture: Awaited<ReturnType<typeof setup>>;
+		fixture = await setup({
+			onWorkStarted: (value) => {
+				if (value === "inspect-draft")
+					json(join(runDir(fixture.harness), "artifacts/draft.json"), { ready_to_seal: true });
+			},
+			onTimeline: (response) => {
+				const macro = JSON.parse(JSON.parse(JSON.parse(response).content[0].text).text);
+				expect(macro.currentStage.gateOutcome).toBe("pending");
+				expect(macro.executorProgress).toContain("next seal it with the original helper");
+				expect(macro.priorUnitActions[0].input).toContain("inspect-prior-source");
+			},
+		});
+		fixture.harness.setResponses([
+			...["inspect-prior-source", "tool-error", "inspect-policy", "inspect-helper"].map((value) =>
+				fauxAssistantMessage([fauxToolCall("work", { value })], { stopReason: "toolUse" }),
+			),
+			fauxAssistantMessage(
+				[
+					{
+						type: "text",
+						text: "The guessed lookup failed; draft is ready, next seal it with the original helper.",
+					},
+					fauxToolCall("work", { value: "inspect-draft" }),
+				],
+				{ stopReason: "toolUse" },
+			),
+			(context) => {
+				const view = context.messages.map(getMessageText).join("\n");
+				expect(view).toContain("Keep original task constraints.");
+				expect(view).toContain("Produce current.json with value=good.");
+				return fauxAssistantMessage([fauxToolCall("work", { value: "good" })], { stopReason: "toolUse" });
+			},
+			() => fixture.finish(),
+		]);
+		await fixture.harness.session.prompt("/sure_feed model=demo");
+		expect(fixture.diagnoses).toBe(0);
+		expect(state(fixture.harness).lastCheck?.outcome).toBe("passed");
+		expect(state(fixture.harness).repairs ?? []).toHaveLength(0);
+		expect(JSON.parse(readFileSync(join(runDir(fixture.harness), "run.json"), "utf8")).status).toBe("success");
+	});
+
+	it("completes after four reviewed repairs while the original fixture gate still permits work", async () => {
+		const fixture = await setup();
+		fixture.harness.setResponses([
+			...["bad-a", "bad-b", "bad-c", "bad-d", "bad-e"].map((value) =>
+				fauxAssistantMessage([fauxToolCall("work", { value })], { stopReason: "toolUse" }),
+			),
+			fauxAssistantMessage([fauxToolCall("work", { value: "good" })], { stopReason: "toolUse" }),
+			() => fixture.finish(),
+		]);
+		await fixture.harness.session.prompt("/sure_feed model=demo");
+		expect(fixture.diagnoses).toBe(4);
+		expect(state(fixture.harness).repairs?.length ?? 0).toBe(4);
+		expect(state(fixture.harness).lastCheck?.outcome).toBe("passed");
+		expect(JSON.parse(readFileSync(join(runDir(fixture.harness), "run.json"), "utf8")).status).toBe("success");
 	});
 
 	it("hands the authored objective and verified prior outputs to diagnosis, then validates the sole repair", async () => {
@@ -472,42 +751,136 @@ describe("Sure executor/supervisor handoff", () => {
 				expect(view).toContain(`"runDir":${JSON.stringify(runDir(fixture.harness))}`);
 				expect(view).not.toContain('"passedArtifacts":');
 				expect(view).not.toContain('"repairs":{"resolve":');
-				return toolReply(fauxToolCall("work", { value: "tool-error" }));
+				return fauxAssistantMessage([fauxToolCall("work", { value: "tool-error" })], { stopReason: "toolUse" });
 			},
-			toolReply(fauxToolCall("work", { value: "tool-error" })),
-			toolReply(fauxToolCall("work", { value: "good" })),
+			fauxAssistantMessage([fauxToolCall("work", { value: "tool-error" })], { stopReason: "toolUse" }),
+			fauxAssistantMessage([fauxToolCall("work", { value: "good" })], { stopReason: "toolUse" }),
 			() => fixture.finish(),
 		]);
 		await fixture.harness.session.prompt("/sure_feed model=demo");
 		expect(fixture.diagnoses).toBe(1);
 		const current = state(fixture.harness);
 		const repair = current.repairs!.find((repair) => repair.source === "supervisor")!;
-		expect(repair.outcome).toBe("passed");
+		expect(repair.gateOutcome).toBe("passed");
+		expect(repair).not.toHaveProperty("outcome");
 		expect(repair.checkVersions).toHaveLength(1);
 		expect(
 			JSON.parse(readFileSync(join(runDir(fixture.harness), `evidence/${repair.checkVersions[0]}.json`), "utf8")),
 		).toMatchObject({ repairId: repair.id, check: { outcome: "passed", unitId: "stage" } });
 		expect(current.pendingRepair).toBeUndefined();
-		expect(current.units.stage).toMatchObject({ directRepairs: 1, supervisorRepairs: 1 });
-		expect(current.repairs?.map((repair) => repair.outcome)).toEqual(["blocked", "passed"]);
-		expect(readFileSync(join(runDir(fixture.harness), "events.jsonl"), "utf8")).not.toContain(
-			'"type":"finish_missing"',
-		);
+	});
+	it("resumes an unfinished direct repair with the spent allowance and no extra diagnosis", async () => {
+		const fixture = await setup();
+		const coordinator = seedInterruptedRun(fixture.harness, "tool");
+		coordinator.state.status = "executing";
+		coordinator.save();
+		fixture.harness.setResponses([
+			(context) => {
+				expect(JSON.stringify(context.messages)).toContain("Keep original task constraints.");
+				return fauxAssistantMessage([fauxToolCall("work", { value: "good" })], { stopReason: "toolUse" });
+			},
+			() => fixture.finish(),
+		]);
+		await fixture.harness.session.prompt(`/sure_resume ${coordinator.run.runId}`);
+		expect(fixture.diagnoses).toBe(0);
+		expect(state(fixture.harness).repairs ?? []).toHaveLength(0);
+		expect(state(fixture.harness)).not.toHaveProperty("pendingDirectRepairId");
 	});
 	it.each(["first", "last"] as const)(
 		"retains first-error correction for each independent subcheck in %s position",
 		async (position) => {
 			const fixture = await setup({ complexSubcheck: position, decision: "pause" });
 			fixture.harness.setResponses([
-				toolReply(fauxToolCall("work", { value: "tool-error" })),
+				fauxAssistantMessage([fauxToolCall("work", { value: "tool-error" })], { stopReason: "toolUse" }),
 				fauxAssistantMessage("Awaiting original-condition verification."),
 			]);
 			await fixture.harness.session.prompt("/sure_feed model=demo");
 			expect(fixture.diagnoses).toBe(0);
-			expect(state(fixture.harness).units.stage.directRepairs).toBe(2);
+			expect(state(fixture.harness).repairs ?? []).toHaveLength(0);
 			expect(state(fixture.harness).attempts).toHaveLength(0);
 		},
 	);
+	it("lets the executor inspect and recover one ordinary tool error without diagnosis", async () => {
+		const fixture = await setup();
+		fixture.harness.setResponses([
+			fauxAssistantMessage([fauxToolCall("work", { value: "tool-error" })], { stopReason: "toolUse" }),
+			(context) => {
+				expect(JSON.stringify(context.messages)).toContain("Keep original task constraints.");
+				return fauxAssistantMessage([fauxToolCall("work", { value: "inspect" })], { stopReason: "toolUse" });
+			},
+			fauxAssistantMessage([fauxToolCall("work", { value: "good" })], { stopReason: "toolUse" }),
+			() => fixture.finish(),
+		]);
+		await fixture.harness.session.prompt("/sure_feed model=demo");
+		expect(fixture.diagnoses).toBe(0);
+		expect(state(fixture.harness).repairs ?? []).toHaveLength(0);
+		expect(state(fixture.harness).lastCheck?.outcome).toBe("passed");
+	});
+	it("keeps three pending research batches inside the local correction", async () => {
+		const fixture = await setup({ decision: "pause" });
+		fixture.harness.setResponses([
+			fauxAssistantMessage([fauxToolCall("work", { value: "tool-error" })], { stopReason: "toolUse" }),
+			...["inspect-a", "inspect-b", "inspect-c"].map((value) =>
+				fauxAssistantMessage([fauxToolCall("work", { value })], { stopReason: "toolUse" }),
+			),
+			fauxAssistantMessage("Awaiting original-condition verification."),
+		]);
+		await fixture.harness.session.prompt("/sure_feed model=demo");
+		const coordination = state(fixture.harness);
+		expect(fixture.executed).toEqual(["tool-error", "inspect-a", "inspect-b", "inspect-c"]);
+		expect(fixture.diagnoses).toBe(0);
+		expect(coordination.attempts).toHaveLength(0);
+		expect(coordination.repairs ?? []).toHaveLength(0);
+		const toolActions = readdirSync(join(runDir(fixture.harness), "evidence/tools")).map((file) =>
+			JSON.parse(readFileSync(join(runDir(fixture.harness), "evidence/tools", file), "utf8")),
+		);
+		const batches = new Set(toolActions.map((action) => action.batchId));
+		expect(batches.size).toBe(4);
+		expect(toolActions.find((action) => action.isError)?.batchId).toBeDefined();
+	});
+
+	it("hands a failed direct repair to the supervisor once, then validates its repair", async () => {
+		const fixture = await setup();
+		fixture.harness.setResponses([
+			fauxAssistantMessage([fauxToolCall("work", { value: "tool-error" })], { stopReason: "toolUse" }),
+			fauxAssistantMessage([fauxToolCall("work", { value: "tool-error" })], { stopReason: "toolUse" }),
+			fauxAssistantMessage([fauxToolCall("work", { value: "good" })], { stopReason: "toolUse" }),
+			() => fixture.finish(),
+		]);
+		await fixture.harness.session.prompt("/sure_feed model=demo");
+		expect(fixture.diagnoses).toBe(1);
+		expect(state(fixture.harness).repairs).toHaveLength(1);
+		expect(state(fixture.harness).repairs?.map((repair) => repair.gateOutcome)).toEqual(["passed"]);
+		expect(readFileSync(join(runDir(fixture.harness), "events.jsonl"), "utf8")).not.toContain(
+			'"type":"finish_missing"',
+		);
+	});
+
+	it("preserves an unattempted correction when the executor ends naturally", async () => {
+		const fixture = await setup({ decision: "pause" });
+		fixture.harness.setResponses([
+			fauxAssistantMessage([fauxToolCall("work", { value: "tool-error" })], { stopReason: "toolUse" }),
+			fauxAssistantMessage("I could not repair this."),
+		]);
+		await fixture.harness.session.prompt("/sure_feed model=demo");
+		expect(fixture.diagnoses).toBe(0);
+		expect(state(fixture.harness).unresolvedCheckVersion).toBeDefined();
+		expect(readFileSync(join(runDir(fixture.harness), "events.jsonl"), "utf8")).toContain('"type":"finish_missing"');
+	});
+
+	it("distinguishes compound original-batch failures from a failed executor repair", async () => {
+		const fixture = await setup({ decision: "pause" });
+		fixture.harness.setResponses([
+			fauxAssistantMessage(
+				[fauxToolCall("work", { value: "tool-error" }), fauxToolCall("work", { value: "tool-error-other" })],
+				{ stopReason: "toolUse" },
+			),
+			fauxAssistantMessage("Awaiting original-condition verification."),
+		]);
+		await fixture.harness.session.prompt("/sure_feed model=demo");
+		expect(fixture.diagnoses).toBe(0);
+		expect(state(fixture.harness).repairs ?? []).toHaveLength(0);
+	});
 	it("persists initial and later user constraints for diagnosis and terminal export", async () => {
 		let timeline = "";
 		const fixture = await setup({
@@ -520,7 +893,7 @@ describe("Sure executor/supervisor handoff", () => {
 		fixture.harness.setResponses([
 			async () => {
 				await fixture.harness.session.prompt("ONLY_REPAIR_CURRENT_ARTIFACT", { streamingBehavior: "steer" });
-				return toolReply(fauxToolCall("work", { value: "bad" }));
+				return fauxAssistantMessage([fauxToolCall("work", { value: "bad" })], { stopReason: "toolUse" });
 			},
 		]);
 		await fixture.harness.session.prompt(
@@ -546,7 +919,7 @@ describe("Sure executor/supervisor handoff", () => {
 			const source = join(import.meta.dirname, "../../../../sure/skills/sure_onboard");
 			const skillDir = join(harness.tempDir, ".sure/skills/sure_onboard");
 			cpSync(source, skillDir, { recursive: true });
-			for (const name of ["index", "stop"])
+			for (const name of ["index"])
 				writeFileSync(
 					join(skillDir, `hooks/${name}.ts`),
 					`export * from ${JSON.stringify(join(source, `hooks/${name}.ts`).replaceAll("\\", "/"))};`,
@@ -571,24 +944,30 @@ describe("Sure executor/supervisor handoff", () => {
 			for (const name of ["package_gate", "deployment_ready", "extraction_declaration"])
 				json(join(run.runDir, `artifacts/${name}.json`), { original: name });
 			harness.setResponses([
-				toolReply(
-					fauxToolCall("sure_finish", {
-						status,
-						manifest_path: join(run.runDir, "manifest.json"),
-						summary: "Onboarding could not prepare its environment.",
-						error_summary: "Required model dependency is unavailable.",
-					}),
+				fauxAssistantMessage(
+					[
+						fauxToolCall("sure_finish", {
+							status,
+							manifest_path: join(run.runDir, "manifest.json"),
+							summary: "Onboarding could not prepare its environment.",
+							error_summary: "Required model dependency is unavailable.",
+						}),
+					],
+					{ stopReason: "toolUse" },
 				),
 				(context) => {
 					const feedback = context.messages.filter((message) => message.role === "toolResult").at(-1)!;
 					expect(getMessageText(feedback)).toContain("Create the final manifest");
 					json(join(run.runDir, "manifest.json"), {});
-					return toolReply(
-						fauxToolCall("sure_finish", {
-							status,
-							manifest_path: join(run.runDir, "manifest.json"),
-							summary: "Retain the actual failure.",
-						}),
+					return fauxAssistantMessage(
+						[
+							fauxToolCall("sure_finish", {
+								status,
+								manifest_path: join(run.runDir, "manifest.json"),
+								summary: "Retain the actual failure.",
+							}),
+						],
+						{ stopReason: "toolUse" },
 					);
 				},
 				(context) => {
@@ -616,31 +995,163 @@ describe("Sure executor/supervisor handoff", () => {
 		},
 	);
 
-	it.each(["bad", "format", "tool-error"])("repairs %s directly through the original gate", async (value) => {
+	it("runs real onboard hooks through inspection, direct repair and a diagnostic pause", async () => {
+		let harness: Harness;
+		let diagnoses = 0;
+		const parameters = Type.Object({ action: Type.String() });
+		const work: AgentTool<typeof parameters> = {
+			name: "fixture_work",
+			label: "Fixture work",
+			description: "Inspect or write the current onboard fixture artifact",
+			parameters,
+			execute: async (_id, { action }) => {
+				const artifacts = join(runDir(harness), "artifacts");
+				if (action === "invalid") json(join(artifacts, "repo_summary.json"), { repo_url: 17 });
+				else if (action === "repair")
+					json(join(artifacts, "repo_summary.json"), { repo_url: "https://example.test/fixture" });
+				else if (action.startsWith("classify")) json(join(artifacts, "classification.json"), { task_type: action });
+				const text =
+					action === "inspect-artifact"
+						? readFileSync(join(artifacts, "repo_summary.json"), "utf8")
+						: action === "inspect-schema"
+							? readFileSync(join(skillDir, "schemas/repo_summary.schema.json"), "utf8")
+							: action;
+				return { content: [{ type: "text", text }], details: {} };
+			},
+		};
+		harness = await createHarness({
+			tools: [work],
+			extensionFactories: [sureExtension],
+			settings: { compaction: { enabled: false }, retry: { enabled: false } },
+			isolatedSessionFactory: async (request) => {
+				diagnoses++;
+				const transcript = fixtureTranscript(request, harness.tempDir);
+				return {
+					getSessionIdentity: transcript.getSessionIdentity,
+					prompt: async () => {
+						await request.tools[0].execute(
+							"macro",
+							{ operation: "timeline" },
+							undefined,
+							undefined,
+							harness.session.extensionRunner.createContext(),
+						);
+						await request.tools[0].execute(
+							"premise",
+							{ operation: "snapshot" },
+							undefined,
+							undefined,
+							harness.session.extensionRunner.createContext(),
+						);
+						await submitControlFixture(
+							request,
+							transcript.manager,
+							harness.session.extensionRunner.createContext(),
+							pauseDiagnosis("Inspect the unsupported classification before resuming."),
+						);
+					},
+					abort: async () => {},
+					dispose: () => {},
+					getMessages: () => transcript.manager.buildSessionContext().messages,
+				};
+			},
+		});
+		harnesses.push(harness);
+		const source = join(import.meta.dirname, "../../../../sure/skills/sure_onboard");
+		const skillDir = join(harness.tempDir, ".sure/skills/sure_onboard");
+		cpSync(source, skillDir, { recursive: true });
+		// Keep production imports anchored in the repository; only fixture data lives in the temp project.
+		for (const name of ["index", "stop"])
+			writeFileSync(
+				join(skillDir, `hooks/${name}.ts`),
+				`export * from ${JSON.stringify(join(source, `hooks/${name}.ts`).replaceAll("\\", "/"))};`,
+			);
+		const discovered = discoverSureSkillPackages(harness.tempDir);
+		expect(discovered.diagnostics).toEqual([]);
+		const manager = new SureRunManager(harness.tempDir);
+		const run = manager.createRun(
+			discovered.packages[0],
+			"model_id=fixture repo=fixture task_type=asr deployment_type=local",
+		);
+		manager.setStatus(run, "running");
+		manager.updateState(run, {
+			phase: { id: "discover", label: "Discover repo", status: "running" },
+			checkpoint: { resumable: true, data: { currentUnit: "discover", completedUnits: [], retries: {} } },
+		});
+		await harness.session.bindExtensions({
+			mode: "tui",
+			onError: (error) => {
+				throw new Error(error.error);
+			},
+		});
+		harness.setResponses(
+			["invalid", "inspect-artifact", "inspect-schema", "repair", "classify-invalid", "classify-still-invalid"].map(
+				(action) => fauxAssistantMessage([fauxToolCall("fixture_work", { action })], { stopReason: "toolUse" }),
+			),
+		);
+		await harness.session.prompt(`/sure_resume ${run.runId}`);
+		const coordination = state(harness);
+		expect(diagnoses).toBe(1);
+		expect(coordination.repairs?.filter((repair) => repair.unitId === "discover") ?? []).toHaveLength(0);
+		expect(coordination).not.toHaveProperty("units");
+		expect(manager.readState(run)?.checkpoint?.data).toMatchObject({ completedUnits: ["discover"] });
+		expect(manager.readRun(run.runId)?.status).toBe("failed");
+		const report = JSON.parse(readFileSync(join(run.runDir, "failure-report.json"), "utf8"));
+		expect(report).toMatchObject({ stage: "classify", outcome: "incomplete" });
+		expect(existsSync(join(run.runDir, "stop-manifest.json"))).toBe(false);
+		expect(coordination.status).toBe("diagnosing");
+		expect(harness.getPendingResponseCount()).toBe(0);
+	});
+
+	it("finishes the normal path with zero diagnoses", async () => {
 		const fixture = await setup();
 		fixture.harness.setResponses([
-			toolReply(fauxToolCall("work", { value })),
-			(context) => {
-				expect(JSON.stringify(context.messages)).toContain("Each independent error has one local correction");
-				return toolReply(fauxToolCall("work", { value: "inspect" }));
-			},
-			toolReply(fauxToolCall("work", { value: "good" })),
+			fauxAssistantMessage([fauxToolCall("work", { value: "good" })], { stopReason: "toolUse" }),
 			() => fixture.finish(),
 		]);
 		await fixture.harness.session.prompt("/sure_feed model=demo device=cuda");
 		expect(fixture.diagnoses).toBe(0);
-		expect(fixture.executed).toEqual([value, "inspect", "good"]);
-		expect(state(fixture.harness).units.stage).toMatchObject({ directRepairs: 1, supervisorRepairs: 0 });
-		expect(state(fixture.harness).repairs?.[0]).toMatchObject({ source: "executor", outcome: "passed" });
+		expect(JSON.parse(readFileSync(join(runDir(fixture.harness), "run.json"), "utf8")).status).toBe("success");
+		expect(JSON.stringify(fixture.harness.session.messages)).not.toContain("FULL_MANUAL_MUST_NOT_BE_INJECTED");
+	});
+
+	it("repairs a semantic failure even when the hook returned ok:true, without finish_missing", async () => {
+		const fixture = await setup();
+		fixture.harness.setResponses([
+			fauxAssistantMessage([fauxToolCall("work", { value: "bad" })], { stopReason: "toolUse" }),
+			(context) => {
+				expect(JSON.stringify(context.messages)).toContain("Keep original task constraints.");
+				return fauxAssistantMessage([fauxToolCall("work", { value: "good" })], { stopReason: "toolUse" });
+			},
+			() => fixture.finish(),
+		]);
+		await fixture.harness.session.prompt("/sure_feed model=demo device=cuda");
+		expect(fixture.diagnoses).toBe(0);
+		expect(fixture.executed).toEqual(["bad", "good"]);
+		expect(state(fixture.harness).repairs?.length ?? 0).toBe(0);
 		expect(readFileSync(join(runDir(fixture.harness), "events.jsonl"), "utf8")).not.toContain(
 			'"type":"finish_missing"',
 		);
 	});
 
+	it("repairs a simple format error directly without a supervisor call", async () => {
+		const fixture = await setup();
+		fixture.harness.setResponses([
+			fauxAssistantMessage([fauxToolCall("work", { value: "format" })], { stopReason: "toolUse" }),
+			fauxAssistantMessage([fauxToolCall("work", { value: "good" })], { stopReason: "toolUse" }),
+			() => fixture.finish(),
+		]);
+		await fixture.harness.session.prompt("/sure_feed model=demo");
+		expect(fixture.diagnoses).toBe(0);
+		expect(state(fixture.harness).repairs ?? []).toHaveLength(0);
+	});
+
 	it("keeps a unit blocked when another hook passes its independent subcheck", async () => {
 		const fixture = await setup({ multipleChecks: true, decision: "pause" });
 		fixture.harness.setResponses([
-			...Array.from({ length: 2 }, () => toolReply(fauxToolCall("work", { value: "bad" }))),
+			...Array.from({ length: 2 }, () =>
+				fauxAssistantMessage([fauxToolCall("work", { value: "bad" })], { stopReason: "toolUse" }),
+			),
 		]);
 		await fixture.harness.session.prompt("/sure_feed model=demo");
 		expect(fixture.diagnoses).toBe(1);
@@ -657,10 +1168,13 @@ describe("Sure executor/supervisor handoff", () => {
 	it("blocks later sequential calls and preserves valid tool-result pairs before a diagnostic pause", async () => {
 		const fixture = await setup({ decision: "pause" });
 		fixture.harness.setResponses([
-			toolReply(fauxToolCall("work", { value: "bad" })),
-			toolReply(
-				fauxToolCall("work", { value: "bad" }, { id: "first" }),
-				fauxToolCall("work", { value: "must-not-run" }, { id: "second" }),
+			fauxAssistantMessage([fauxToolCall("work", { value: "bad" })], { stopReason: "toolUse" }),
+			fauxAssistantMessage(
+				[
+					fauxToolCall("work", { value: "bad" }, { id: "first" }),
+					fauxToolCall("work", { value: "must-not-run" }, { id: "second" }),
+				],
+				{ stopReason: "toolUse" },
 			),
 		]);
 		await fixture.harness.session.prompt("/sure_feed model=demo");
@@ -685,6 +1199,34 @@ describe("Sure executor/supervisor handoff", () => {
 		});
 	});
 
+	it("waits for all already-started parallel tools and snapshots script-made edits", async () => {
+		const fixture = await setup({ decision: "pause", parallel: true });
+		fixture.harness.setResponses([
+			fauxAssistantMessage([fauxToolCall("work", { value: "bad" })], { stopReason: "toolUse" }),
+			fauxAssistantMessage([fauxToolCall("work", { value: "bad" }), fauxToolCall("work", { value: "slow" })], {
+				stopReason: "toolUse",
+			}),
+		]);
+		await fixture.harness.session.prompt("/sure_feed model=demo");
+		expect(fixture.completed).toEqual(["bad", "bad", "slow"]);
+		const current = state(fixture.harness);
+		const snapshot = JSON.parse(
+			readFileSync(join(runDir(fixture.harness), "snapshots", `${current.latestSnapshot}.json`), "utf8"),
+		);
+		expect(JSON.stringify(snapshot)).toContain("script edit after failure");
+		expect(current.attempts).toHaveLength(1);
+		const observations = readdirSync(join(runDir(fixture.harness), "evidence/tools")).map((name) =>
+			JSON.parse(readFileSync(join(runDir(fixture.harness), "evidence/tools", name), "utf8")),
+		);
+		expect(observations.find((action) => action.input.value === "slow")).toMatchObject({
+			unitId: "stage",
+			execution: "returned",
+			duringHold: true,
+			isError: false,
+		});
+		expect(current.lastCheckVersion).toBe(2);
+	});
+
 	it("hands over sixteen actions in one macro page without running gates for five drained results", async () => {
 		let macro:
 			| {
@@ -696,11 +1238,12 @@ describe("Sure executor/supervisor handoff", () => {
 		const fixture = await setup({
 			decision: "pause",
 			parallel: true,
+			longReads: true,
 			priorStages: true,
 			onTimeline: (text) => {
 				const page = JSON.parse(JSON.parse(text).content[0].text);
 				expect(page.complete).toBe(true);
-				expect(page.totalCharacters).toBeLessThanOrEqual(8000);
+				expect(page.totalCharacters).toBeLessThanOrEqual(50 * 1024);
 				macro = JSON.parse(page.text);
 			},
 		});
@@ -718,7 +1261,7 @@ describe("Sure executor/supervisor handoff", () => {
 				[
 					fauxToolCall("work", { value: "tool-error" }, { id: "later-error" }),
 					...Array.from({ length: 5 }, (_, i) =>
-						fauxToolCall("work", { value: i === 0 ? "slow" : `inspect-slow-${i}` }, { id: `drained-${i}` }),
+						fauxToolCall("work", { value: `inspect-slow-${i}` }, { id: `drained-${i}` }),
 					),
 				],
 				{ stopReason: "toolUse" },
@@ -735,12 +1278,9 @@ describe("Sure executor/supervisor handoff", () => {
 		expect(macro?.currentAttempt.batches.map((batch) => batch.phase)).toEqual(["trigger_batch", "subsequent_batch"]);
 		expect(macro?.stages).toHaveLength(3);
 		expect(macro?.diffIndex).toBeDefined();
-		expect(state(fixture.harness).units.stage).toMatchObject({
-			calls: 16,
-			checks: 11,
-			directRepairs: 1,
-			supervisorRepairs: 0,
-		});
+		expect(
+			readdirSync(join(runDir(fixture.harness), "evidence")).filter((name) => /^\d+\.json$/.test(name)),
+		).toHaveLength(13);
 		const observations = readdirSync(join(runDir(fixture.harness), "evidence/tools")).map((name) =>
 			JSON.parse(readFileSync(join(runDir(fixture.harness), "evidence/tools", name), "utf8")),
 		);
@@ -750,12 +1290,6 @@ describe("Sure executor/supervisor handoff", () => {
 			JSON.parse(readFileSync(join(runDir(fixture.harness), "evidence/hooks", name), "utf8")),
 		);
 		expect(hooks.filter((hook) => hook.point === "post_tool_result")).toHaveLength(11);
-		const current = state(fixture.harness);
-		const snapshot = readFileSync(
-			join(runDir(fixture.harness), "snapshots", `${current.latestSnapshot}.json`),
-			"utf8",
-		);
-		expect(snapshot).toContain("script edit after failure");
 	});
 
 	it("records a late tool error for diagnosis without replacing the original complex blocker", async () => {
@@ -770,14 +1304,17 @@ describe("Sure executor/supervisor handoff", () => {
 			},
 		});
 		fixture.harness.setResponses([
-			toolReply(fauxToolCall("work", { value: "bad" })),
-			toolReply(
-				fauxToolCall("work", { value: "bad" }, { id: "complex-blocker" }),
-				fauxToolCall("work", { value: "tool-error-late" }, { id: "late-error" }),
+			fauxAssistantMessage([fauxToolCall("work", { value: "bad" })], { stopReason: "toolUse" }),
+			fauxAssistantMessage(
+				[
+					fauxToolCall("work", { value: "bad" }, { id: "complex-blocker" }),
+					fauxToolCall("work", { value: "tool-error-late" }, { id: "late-error" }),
+				],
+				{ stopReason: "toolUse" },
 			),
 		]);
 		await fixture.harness.session.prompt("/sure_feed model=demo");
-		expect(state(fixture.harness).units.stage).toMatchObject({ checks: 2, directRepairs: 1, supervisorRepairs: 0 });
+		expect(state(fixture.harness).lastCheckVersion).toBe(2);
 		expect(state(fixture.harness).lastFailure?.summary).toBe("Gate saw bad");
 		expect(macro?.currentAttempt.actions.slice(-2)).toMatchObject([
 			{ toolCallId: "complex-blocker", isError: false, outcome: "blocked" },
@@ -795,7 +1332,12 @@ describe("Sure executor/supervisor handoff", () => {
 			});
 			const fixture = await setup({ onWorkStarted: () => started(), delayGate });
 			fixture.harness.setResponses([
-				toolReply(fauxToolCall("work", { value: delayGate ? "good" : "slow" }, { id: "shutdown-late" })),
+				fauxAssistantMessage(
+					[fauxToolCall("work", { value: delayGate ? "good" : "slow" }, { id: "shutdown-late" })],
+					{
+						stopReason: "toolUse",
+					},
+				),
 				fauxAssistantMessage("must not be called"),
 			]);
 			const pending = fixture.harness.session.prompt("/sure_feed model=demo");
@@ -809,7 +1351,7 @@ describe("Sure executor/supervisor handoff", () => {
 			expect(fixture.completed).toEqual([delayGate ? "good" : "slow"]);
 			expect(fixture.diagnoses).toBe(0);
 			const current = state(fixture.harness);
-			expect(current.units.stage.checks).toBe(0);
+			expect(current.lastCheckVersion).toBeUndefined();
 			const run = JSON.parse(readFileSync(join(runDir(fixture.harness), "run.json"), "utf8"));
 			expect(new SureRunManager(fixture.harness.tempDir).readState(run)?.checkpoint?.data).toMatchObject({
 				completedUnits: [],
@@ -824,6 +1366,43 @@ describe("Sure executor/supervisor handoff", () => {
 				),
 			).toBe(true);
 			expect(fixture.harness.getPendingResponseCount()).toBe(1);
+		},
+	);
+
+	it.each(["run", "session", "branch", "message"] as const)(
+		"pauses an unconfirmed receipt from another %s without replay",
+		async (mismatch) => {
+			const fixture = await setup();
+			const coordinator = seedInterruptedRun(fixture.harness);
+			coordinator.acceptDiagnosis(result(fixture.harness));
+			const pending = coordinator.state.pendingRepair!;
+			const session = fixture.harness.sessionManager;
+			const anchor = session.appendMessage(fauxAssistantMessage("Current executor branch", { timestamp: 1 }));
+			pending.deliveryStarted = true;
+			pending.receiverSessionId = mismatch === "session" ? "another-session" : session.getSessionId();
+			pending.receiverSessionFile = session.getSessionFile();
+			pending.receiverParentId = anchor;
+			pending.receiverMessageId = session.appendMessage({
+				role: "user",
+				timestamp: 2,
+				content: `<sure_supervisor_repair id="${pending.id}" run_id="${mismatch === "run" ? "another-run" : coordinator.run.runId}" unit="stage">Repair the current artifact and rerun its original gate.</sure_supervisor_repair>`,
+			});
+			if (mismatch === "message") pending.receiverMessageId = "another-message";
+			if (mismatch === "branch") {
+				session.branch(anchor);
+				session.appendMessage(fauxAssistantMessage("Sibling branch", { timestamp: 3 }));
+			}
+			coordinator.save();
+			fixture.harness.session.agent.state.messages = session.buildSessionContext().messages;
+			fixture.harness.setResponses([fauxAssistantMessage("must not run")]);
+			await fixture.harness.session.prompt(`/sure_resume ${coordinator.run.runId}`);
+			expect(fixture.diagnoses).toBe(0);
+			expect(fixture.executed).toEqual([]);
+			expect(fixture.harness.getPendingResponseCount()).toBe(1);
+			expect(state(fixture.harness).attempts.at(-1)?.checkpoint?.checkpoint).toContain(
+				"handoff_delivery_unconfirmed",
+			);
+			expect(state(fixture.harness).pendingRepair?.delivered).toBe(false);
 		},
 	);
 
@@ -869,7 +1448,7 @@ describe("Sure executor/supervisor handoff", () => {
 				});
 				expect(readFileSync(join(directory, late.name), "utf8")).toBe(original);
 				expect(state(harness).evidenceVersion).toBe(before.evidenceVersion);
-				expect(state(harness).units).toEqual(before.units);
+				expect(state(harness).lastCheckVersion).toEqual(before.lastCheckVersion);
 				const snapshot = JSON.parse(
 					readFileSync(join(runDir(harness), "snapshots", `${before.latestSnapshot}.json`), "utf8"),
 				);
@@ -882,15 +1461,18 @@ describe("Sure executor/supervisor handoff", () => {
 			},
 		});
 		fixture.harness.setResponses([
-			toolReply(fauxToolCall("work", { value: "bad" })),
-			toolReply(
-				fauxToolCall("work", { value: "bad" }, { id: "first" }),
-				fauxToolCall("work", { value: "slow" }, { id: "late" }),
+			fauxAssistantMessage([fauxToolCall("work", { value: "bad" })], { stopReason: "toolUse" }),
+			fauxAssistantMessage(
+				[
+					fauxToolCall("work", { value: "bad" }, { id: "first" }),
+					fauxToolCall("work", { value: "slow" }, { id: "late" }),
+				],
+				{ stopReason: "toolUse" },
 			),
 		]);
 		await fixture.harness.session.prompt("/sure_feed model=demo");
 		expect(state(fixture.harness).attempts[0].error).toBeUndefined();
-		expect(state(fixture.harness).units.stage.checks).toBe(2);
+		expect(state(fixture.harness).lastCheckVersion).toBe(2);
 	});
 
 	it.each(["artifact", "contract"])(
@@ -918,7 +1500,9 @@ describe("Sure executor/supervisor handoff", () => {
 				},
 			});
 			fixture.harness.setResponses([
-				...Array.from({ length: 2 }, () => toolReply(fauxToolCall("work", { value: "bad" }))),
+				...Array.from({ length: 2 }, () =>
+					fauxAssistantMessage([fauxToolCall("work", { value: "bad" })], { stopReason: "toolUse" }),
+				),
 			]);
 			await fixture.harness.session.prompt(
 				`/sure_feed model=demo output_dir=${join(fixture.harness.tempDir, "output")}`,
@@ -936,11 +1520,31 @@ describe("Sure executor/supervisor handoff", () => {
 		coordinator.beginDiagnosis();
 		coordinator.state.attempts[0].result = result(fixture.harness);
 		coordinator.save();
-		fixture.harness.setResponses([toolReply(fauxToolCall("work", { value: "good" })), () => fixture.finish()]);
+		fixture.harness.setResponses([
+			fauxAssistantMessage([fauxToolCall("work", { value: "good" })], { stopReason: "toolUse" }),
+			() => fixture.finish(),
+		]);
 		await fixture.harness.session.prompt(`/sure_resume ${coordinator.run.runId}`);
 		expect(fixture.diagnoses).toBe(0);
 		expect(fixture.executed).toEqual(["good"]);
-		expect(state(fixture.harness).units.stage.supervisorRepairs).toBe(1);
+		expect(state(fixture.harness).repairs?.length ?? 0).toBe(1);
+	});
+
+	it("restores persisted user constraints into a resumed executor with an empty transcript", async () => {
+		const fixture = await setup();
+		const coordinator = seedInterruptedRun(fixture.harness);
+		syncSureUserContext(coordinator, [{ role: "user", content: "NO_NETWORK_DOWNLOADS", timestamp: 1 }]);
+		coordinator.acceptDiagnosis(result(fixture.harness));
+		fixture.harness.setResponses([
+			(context) => {
+				expect(JSON.stringify(context.messages)).toContain("NO_NETWORK_DOWNLOADS");
+				return fauxAssistantMessage([fauxToolCall("work", { value: "good" })], { stopReason: "toolUse" });
+			},
+			() => fixture.finish(),
+		]);
+		await fixture.harness.session.prompt(`/sure_resume ${coordinator.run.runId}`);
+		expect(fixture.diagnoses).toBe(0);
+		expect(fixture.executed).toEqual(["good"]);
 	});
 
 	it.each([false, true])(
@@ -948,89 +1552,80 @@ describe("Sure executor/supervisor handoff", () => {
 		async (delivered) => {
 			const fixture = await setup();
 			const coordinator = seedInterruptedRun(fixture.harness);
-			syncSureUserContext(coordinator, [{ role: "user", content: "NO_NETWORK_DOWNLOADS", timestamp: 1 }]);
 			coordinator.acceptDiagnosis(result(fixture.harness));
 			if (coordinator.state.pendingRepair) coordinator.state.pendingRepair.delivered = delivered;
-			if (delivered)
-				fixture.harness.session.sessionManager.appendMessage({
+			if (delivered) {
+				const pending = coordinator.state.pendingRepair!;
+				pending.deliveryStarted = true;
+				pending.receiverSessionId = fixture.harness.sessionManager.getSessionId();
+				pending.receiverSessionFile = fixture.harness.sessionManager.getSessionFile();
+				pending.receiverParentId = fixture.harness.sessionManager.getLeafId();
+				pending.receiverMessageId = fixture.harness.session.sessionManager.appendMessage({
 					role: "user",
 					timestamp: Date.now(),
-					content: `<sure_supervisor_repair id="${coordinator.state.pendingRepair!.id}" run_id="${coordinator.run.runId}">Repair the current artifact and rerun its original gate.</sure_supervisor_repair>`,
+					content: `<sure_supervisor_repair id="${pending.id}" run_id="${coordinator.run.runId}" unit="stage">Repair the current artifact and rerun its original gate.</sure_supervisor_repair>`,
 				});
-			json(join(runDir(fixture.harness), "artifacts/current.json"), { value: "draft" });
-			coordinator.observe(
-				{
-					unitId: "stage",
-					outcome: "pending",
-					summary: "Supporting work recorded",
-					inputPaths: [],
-					artifactPaths: ["run:artifacts/current.json"],
-				},
-				[
-					"run:artifacts",
-					...surePromptPaths(discoverSureSkillPackages(fixture.harness.tempDir).packages[0], "stage"),
-				],
-			);
+			}
 			coordinator.save();
 			// Native reopen restores both the branch and its in-memory messages.
 			fixture.harness.session.agent.state.messages = fixture.harness.sessionManager.buildSessionContext().messages;
 			fixture.harness.setResponses([
 				(context) => {
-					expect(JSON.stringify(context.messages)).toContain("NO_NETWORK_DOWNLOADS");
 					expect(JSON.stringify(context.messages)).toContain(
 						"Repair the current artifact and rerun its original gate.",
 					);
-					return toolReply(fauxToolCall("work", { value: "good" }));
+					return fauxAssistantMessage([fauxToolCall("work", { value: "good" })], { stopReason: "toolUse" });
 				},
 				() => fixture.finish(),
 			]);
 			await fixture.harness.session.prompt(`/sure_resume ${coordinator.run.runId}`);
 			expect(fixture.diagnoses).toBe(0);
 			expect(fixture.executed).toEqual(["good"]);
-			expect(state(fixture.harness).units.stage.supervisorRepairs).toBe(1);
+			expect(state(fixture.harness).repairs?.length ?? 0).toBe(1);
 			expect(state(fixture.harness).pendingRepair).toBeUndefined();
 		},
 	);
 
-	it("links independent and related errors to one supervisor goal through sure_update_state", async () => {
+	it("resumes with review counters retained instead of imposing a new business cap", async () => {
 		const fixture = await setup();
 		const coordinator = seedInterruptedRun(fixture.harness);
-		coordinator.acceptDiagnosis(result(fixture.harness));
-		const parentId = coordinator.state.pendingRepair!.id;
-		const associate = (relation: "independent" | "related") => () =>
-			toolReply(
-				fauxToolCall("sure_update_state", {
-					repair_verification: {
-						repair_id: parentId,
-						check_version: state(fixture.harness).lastCheckVersion,
-						relation,
-					},
-				}),
-			);
+		for (let i = 0; i < 80; i++) coordinator.recordAction("stage");
+		coordinator.stop("Legacy unit action threshold.");
 		fixture.harness.setResponses([
-			toolReply(fauxToolCall("work", { value: "tool-error-probe" })),
-			associate("independent"),
-			toolReply(fauxToolCall("work", { value: "related-blocker" })),
-			associate("related"),
-			toolReply(fauxToolCall("work", { value: "good" })),
+			fauxAssistantMessage([fauxToolCall("work", { value: "good" })], { stopReason: "toolUse" }),
 			() => fixture.finish(),
 		]);
 		await fixture.harness.session.prompt(`/sure_resume ${coordinator.run.runId}`);
-		const current = state(fixture.harness);
-		const children = current.repairs!.filter((repair) => repair.parentRepairId === parentId);
-		expect(children.map((repair) => repair.relation)).toEqual(["independent", "related"]);
-		for (const repair of children) {
-			expect(repair.outcome).toBe("passed");
-			expect(
-				JSON.parse(
-					readFileSync(join(runDir(fixture.harness), `evidence/${repair.triggerCheckVersion}.json`), "utf8"),
-				).repairId,
-			).toBe(repair.id);
-		}
-		expect(current.repairs!.find((repair) => repair.id === parentId)?.outcome).toBe("passed");
-		expect(current.pendingRepair).toBeUndefined();
+		expect(fixture.executed).toEqual(["good"]);
 		expect(fixture.diagnoses).toBe(0);
-		expect(fixture.harness.getPendingResponseCount()).toBe(0);
+		expect(state(fixture.harness)).not.toHaveProperty("units");
+		expect(JSON.parse(readFileSync(join(runDir(fixture.harness), "run.json"), "utf8")).status).toBe("success");
+	});
+
+	it("resumes a supervisor goal after recorded supporting work without retiring local correction identities", async () => {
+		const fixture = await setup();
+		const coordinator = seedInterruptedRun(fixture.harness);
+		coordinator.acceptDiagnosis(result(fixture.harness));
+		const taskId = coordinator.state.pendingRepair!.id;
+		json(join(runDir(fixture.harness), "artifacts/current.json"), { value: "draft" });
+		coordinator.observe(
+			{
+				unitId: "stage",
+				outcome: "pending",
+				summary: "Supporting work recorded",
+				inputPaths: [],
+				artifactPaths: ["run:artifacts/current.json"],
+			},
+			["run:artifacts", ...surePromptPaths(discoverSureSkillPackages(fixture.harness.tempDir).packages[0], "stage")],
+		);
+		fixture.harness.setResponses([
+			fauxAssistantMessage([fauxToolCall("work", { value: "good" })], { stopReason: "toolUse" }),
+			() => fixture.finish(),
+		]);
+		await fixture.harness.session.prompt(`/sure_resume ${coordinator.run.runId}`);
+		expect(fixture.diagnoses).toBe(0);
+		expect(state(fixture.harness).repairs).toHaveLength(1);
+		expect(state(fixture.harness).repairs!.find((repair) => repair.id === taskId)?.gateOutcome).toBe("passed");
 	});
 
 	it("invalidates an accepted repair when files changed before resume and obtains fresh evidence", async () => {
@@ -1039,27 +1634,73 @@ describe("Sure executor/supervisor handoff", () => {
 		coordinator.acceptDiagnosis(result(fixture.harness));
 		const oldVersion = coordinator.state.evidenceVersion;
 		json(join(runDir(fixture.harness), "artifacts/current.json"), { value: "externally-changed" });
-		fixture.harness.setResponses([toolReply(fauxToolCall("work", { value: "good" })), () => fixture.finish()]);
+		fixture.harness.setResponses([
+			fauxAssistantMessage([fauxToolCall("work", { value: "good" })], { stopReason: "toolUse" }),
+			() => fixture.finish(),
+		]);
 		await fixture.harness.session.prompt(`/sure_resume ${coordinator.run.runId}`);
 		expect(fixture.diagnoses).toBe(1);
 		expect(state(fixture.harness).attempts[0].evidenceVersion).toBeGreaterThan(oldVersion);
-		expect(state(fixture.harness).units.stage.supervisorRepairs).toBe(2);
+		expect(state(fixture.harness).repairs?.length ?? 0).toBe(2);
 		expect(
 			state(fixture.harness)
 				.repairs?.filter((repair) => repair.source === "supervisor")
-				.map((repair) => repair.outcome),
-		).toEqual(["invalidated", "passed"]);
+				.map((repair) => repair.gateOutcome ?? repair.stopReason),
+		).toEqual([expect.stringContaining("changed"), "passed"]);
 		expect(fixture.executed).toEqual(["good"]);
+	});
+
+	it("cancels both roles and reports cancellation without generating a final model summary", async () => {
+		const fixture = await setup({
+			duringDiagnosis: (harness) => {
+				void harness.session.abort();
+			},
+		});
+		fixture.harness.setResponses([
+			...Array.from({ length: 2 }, () =>
+				fauxAssistantMessage([fauxToolCall("work", { value: "bad" })], { stopReason: "toolUse" }),
+			),
+			fauxAssistantMessage("must not be called"),
+		]);
+		await fixture.harness.session.prompt("/sure_feed model=demo");
+		expect(fixture.executed).toEqual(["bad", "bad"]);
+		expect(fixture.harness.getPendingResponseCount()).toBe(1);
+		expect(JSON.parse(readFileSync(join(runDir(fixture.harness), "run.json"), "utf8")).status).toBe("cancelled");
+		expect(JSON.parse(readFileSync(join(runDir(fixture.harness), "failure-report.json"), "utf8"))).toMatchObject({
+			outcome: "cancelled",
+			resumable: false,
+		});
+		expect(readFileSync(join(runDir(fixture.harness), "events.jsonl"), "utf8")).not.toContain(
+			'"type":"finish_missing"',
+		);
 	});
 
 	it("diagnoses ok:true plus a blocked phase even without an explicit error classification", async () => {
 		const fixture = await setup({ omitCheck: true, decision: "pause" });
 		fixture.harness.setResponses([
-			...Array.from({ length: 2 }, () => toolReply(fauxToolCall("work", { value: "bad" }))),
+			...Array.from({ length: 2 }, () =>
+				fauxAssistantMessage([fauxToolCall("work", { value: "bad" })], { stopReason: "toolUse" }),
+			),
 		]);
 		await fixture.harness.session.prompt("/sure_feed model=demo");
 		expect(fixture.diagnoses).toBe(1);
 		expect(state(fixture.harness).lastCheck?.outcome).toBe("blocked");
+	});
+
+	it("keeps the original execution failure when the supervisor is unavailable", async () => {
+		const fixture = await setup({ factoryError: true });
+		fixture.harness.setResponses([
+			...Array.from({ length: 2 }, () =>
+				fauxAssistantMessage([fauxToolCall("work", { value: "bad" })], { stopReason: "toolUse" }),
+			),
+			fauxAssistantMessage("must not be called"),
+		]);
+		await fixture.harness.session.prompt("/sure_feed model=demo");
+		const report = JSON.parse(readFileSync(join(runDir(fixture.harness), "failure-report.json"), "utf8"));
+		expect(report.facts).toContain("Gate saw bad");
+		expect(report.diagnosisStatus).toBe("unavailable");
+		expect(report.stopReason).toContain("Supervisor provider unavailable");
+		expect(fixture.harness.getPendingResponseCount()).toBe(1);
 	});
 
 	it("bounds headless auto nudges without terminalizing the business run", async () => {
@@ -1072,20 +1713,18 @@ describe("Sure executor/supervisor handoff", () => {
 		expect(state(fixture.harness).stopReason).toBeUndefined();
 	});
 
-	it.each(["tool", "provider"])("retains the original %s failure when the supervisor is unavailable", async (kind) => {
+	it("retains baseline handling of a first executor provider error without an unnecessary debugger call", async () => {
 		const fixture = await setup({ factoryError: true });
 		fixture.harness.setResponses([
-			...(kind === "tool"
-				? Array.from({ length: 2 }, () => toolReply(fauxToolCall("work", { value: "bad" })))
-				: [fauxAssistantMessage("", { stopReason: "error", errorMessage: "Original executor provider failure." })]),
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "Original executor provider failure." }),
 			fauxAssistantMessage("must not be called"),
 		]);
 		await fixture.harness.session.prompt("/sure_feed model=demo");
-		expect(fixture.diagnoses).toBe(1);
-		const report = JSON.parse(readFileSync(join(runDir(fixture.harness), "failure-report.json"), "utf8"));
-		expect(report.facts).toContain(kind === "tool" ? "Gate saw bad" : "Original executor provider failure.");
-		expect(report.diagnosisStatus).toBe("unavailable");
-		expect(report.stopReason).toContain("Supervisor provider unavailable");
+		expect(fixture.diagnoses).toBe(0);
+		expect(JSON.parse(readFileSync(join(runDir(fixture.harness), "run.json"), "utf8")).lastRepair).toContain(
+			"Original executor provider failure.",
+		);
+		expect(state(fixture.harness).lastFailure?.summary).toBe("Original executor provider failure.");
 		expect(fixture.harness.getPendingResponseCount()).toBe(1);
 	});
 
@@ -1113,13 +1752,16 @@ describe("Sure executor/supervisor handoff", () => {
 			]);
 			coordinator.acceptDiagnosis(result(fixture.harness));
 			fixture.harness.setResponses([
-				toolReply(
-					fauxToolCall("sure_finish", {
-						status,
-						manifest_path: manifest,
-						summary: "Executor-declared failure",
-						error_summary: "Original task could not proceed.",
-					}),
+				fauxAssistantMessage(
+					[
+						fauxToolCall("sure_finish", {
+							status,
+							manifest_path: manifest,
+							summary: "Executor-declared failure",
+							error_summary: "Original task could not proceed.",
+						}),
+					],
+					{ stopReason: "toolUse" },
 				),
 			]);
 			await fixture.harness.session.prompt(`/sure_resume ${coordinator.run.runId}`);
@@ -1143,7 +1785,7 @@ describe("Sure executor/supervisor handoff", () => {
 		});
 		const fixture = await setup({ onWorkStarted: () => started?.() });
 		fixture.harness.setResponses([
-			toolReply(fauxToolCall("work", { value: "slow" })),
+			fauxAssistantMessage([fauxToolCall("work", { value: "slow" })], { stopReason: "toolUse" }),
 			fauxAssistantMessage("must not be called"),
 		]);
 		const pending = fixture.harness.session.prompt("/sure_feed model=demo");
@@ -1160,12 +1802,8 @@ describe("Sure executor/supervisor handoff", () => {
 		"keeps an idle unfinished run failed and resumable on %s, then resumes through the original gate",
 		async (reason) => {
 			const fixture = await setup();
-			fixture.harness.setResponses([
-				toolReply(fauxToolCall("work", { value: "tool-error" })),
-				fauxAssistantMessage("Work remains at the saved checkpoint."),
-			]);
+			fixture.harness.setResponses([fauxAssistantMessage("Work remains at the saved checkpoint.")]);
 			await fixture.harness.session.prompt("/sure_feed model=demo");
-			expect(state(fixture.harness).pendingDirectRepairId).toBeDefined();
 			const directory = runDir(fixture.harness);
 			await fixture.harness.session.extensionRunner.emit({ type: "session_shutdown", reason });
 			const run = JSON.parse(readFileSync(join(directory, "run.json"), "utf8"));
@@ -1175,7 +1813,10 @@ describe("Sure executor/supervisor handoff", () => {
 			expect(new SureRunManager(fixture.harness.tempDir).readState(run)?.checkpoint?.resumable).toBe(true);
 			expect(existsSync(join(directory, ".coordination-owner.json"))).toBe(false);
 			expect(existsSync(join(directory, "artifacts/stopped.json"))).toBe(false);
-			fixture.harness.setResponses([toolReply(fauxToolCall("work", { value: "good" })), () => fixture.finish()]);
+			fixture.harness.setResponses([
+				fauxAssistantMessage([fauxToolCall("work", { value: "good" })], { stopReason: "toolUse" }),
+				() => fixture.finish(),
+			]);
 			await fixture.harness.session.prompt(`/sure_resume ${run.runId}`);
 			expect(JSON.parse(readFileSync(join(directory, "run.json"), "utf8")).status).toBe("success");
 			expect(fixture.diagnoses).toBe(0);
@@ -1218,7 +1859,9 @@ describe("Sure executor/supervisor handoff", () => {
 			},
 		});
 		fixture.harness.setResponses([
-			...Array.from({ length: 2 }, () => toolReply(fauxToolCall("work", { value: "bad" }))),
+			...Array.from({ length: 2 }, () =>
+				fauxAssistantMessage([fauxToolCall("work", { value: "bad" })], { stopReason: "toolUse" }),
+			),
 			fauxAssistantMessage("must not run after shutdown"),
 		]);
 		await fixture.harness.session.prompt("/sure_feed model=demo");
@@ -1234,7 +1877,7 @@ describe("Sure executor/supervisor handoff", () => {
 	it("does not accept a finish gate that returns after user cancellation", async () => {
 		const fixture = await setup({ delayFinish: true });
 		fixture.harness.setResponses([
-			toolReply(fauxToolCall("work", { value: "good" })),
+			fauxAssistantMessage([fauxToolCall("work", { value: "good" })], { stopReason: "toolUse" }),
 			() => fixture.finish(),
 			fauxAssistantMessage("must not run after cancellation"),
 		]);
@@ -1248,4 +1891,37 @@ describe("Sure executor/supervisor handoff", () => {
 		expect(run.manifestPath).toBeUndefined();
 		expect(fixture.harness.getPendingResponseCount()).toBe(1);
 	});
+
+	it.each(["before_accept", "after_accept"])(
+		"does not revive or deliver a cached handoff when cancellation arrives %s",
+		async (when) => {
+			const original = SureCoordinator.prototype.acceptDiagnosis;
+			let accepts = 0;
+			vi.spyOn(SureCoordinator.prototype, "acceptDiagnosis").mockImplementation(function (
+				this: SureCoordinator,
+				value,
+			) {
+				if (++accepts > 1) throw new Error("Cancelled diagnosis was retried.");
+				if (when === "before_accept") this.stop("User cancelled at the handoff boundary.", true);
+				const accepted = original.call(this, value);
+				if (when === "after_accept") this.stop("User cancelled at the handoff boundary.", true);
+				return accepted;
+			});
+			const fixture = await setup();
+			fixture.harness.setResponses([
+				...Array.from({ length: 2 }, () =>
+					fauxAssistantMessage([fauxToolCall("work", { value: "bad" })], { stopReason: "toolUse" }),
+				),
+				fauxAssistantMessage("must not run after cancellation"),
+			]);
+			await fixture.harness.session.prompt("/sure_feed model=demo");
+			expect(accepts).toBe(1);
+			expect(fixture.diagnoses).toBe(1);
+			expect(state(fixture.harness)).toMatchObject({ status: "stopped", cancelled: true });
+			expect(state(fixture.harness).pendingRepair?.delivered).not.toBe(true);
+			expect(JSON.stringify(fixture.harness.session.messages)).not.toContain("<sure_supervisor_repair");
+			expect(fixture.harness.getPendingResponseCount()).toBe(1);
+			expect(JSON.parse(readFileSync(join(runDir(fixture.harness), "run.json"), "utf8")).status).toBe("cancelled");
+		},
+	);
 });

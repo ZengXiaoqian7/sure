@@ -17,6 +17,8 @@ import { FIRST_UNIT, LAST_UNIT, nextUnit } from "./state-machine.ts";
 //   3. gateCheck — gate units run a Python semantic script via spawnSync.
 
 export interface GateResult {
+	condition?: { id: string; target?: string; localRepair?: boolean };
+	localProgress?: boolean;
 	execution?: { exitCode: number | null; stdout: string; stderr: string };
 	ok: boolean;
 	repair?: string;

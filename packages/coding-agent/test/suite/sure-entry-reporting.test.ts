@@ -86,6 +86,25 @@ it("reports a failed coordination restore without overwriting its corrupt eviden
 	expect(harness.getPendingResponseCount()).toBe(1);
 });
 
+it("keeps an old active protocol entirely read-only when resume is requested", async () => {
+	const { harness, skill } = await setup("tui");
+	const manager = new SureRunManager(harness.tempDir);
+	const run = manager.createRun(skill, "");
+	manager.setStatus(run, "failed");
+	manager.updateState(run, { checkpoint: { resumable: true, data: { currentUnit: "stage" } } });
+	writeFileSync(
+		join(run.runDir, "coordination.json"),
+		JSON.stringify({ version: 1, status: "executing", runId: run.runId }),
+	);
+	const paths = ["run.json", "state.json", "events.jsonl", "coordination.json"];
+	const before = paths.map((path) => readFileSync(join(run.runDir, path), "utf8"));
+	await harness.session.prompt(`/sure_resume ${run.runId}`);
+	expect(paths.map((path) => readFileSync(join(run.runDir, path), "utf8"))).toEqual(before);
+	expect(existsSync(join(run.runDir, "failure-report.json"))).toBe(false);
+	expect(existsSync(join(run.runDir, ".coordination-owner.json"))).toBe(false);
+	expect(harness.getPendingResponseCount()).toBe(1);
+});
+
 it("uses the same fallback when coordination cannot be installed after the start hook", async () => {
 	const { harness, skill } = await setup("tui");
 	writeFileSync(

@@ -50,7 +50,7 @@ function openRouterAuto(): Model<"openai-completions"> {
 	};
 }
 
-describe("openai-completions usage observation", () => {
+describe("openai-completions usage normalization", () => {
 	it.each([
 		{ raw: {}, cache: 0, input: 100 },
 		{ raw: { prompt_tokens_details: { cached_tokens: 0 } }, cache: 0, input: 100 },
@@ -59,8 +59,7 @@ describe("openai-completions usage observation", () => {
 		{ raw: { prompt_cache_hit_tokens: 14 }, cache: 14, input: 86 },
 		{ raw: { cached_tokens: 16 }, cache: 16, input: 84 },
 		{ raw: { prompt_tokens_details: { cached_tokens: 0 }, cached_tokens: 16 }, cache: 0, input: 100 },
-	])("preserves raw field presence and existing precedence: $raw", async ({ raw, cache, input }) => {
-		const events: unknown[] = [];
+	])("preserves existing cache precedence: $raw", async ({ raw, cache, input }) => {
 		const usage = { prompt_tokens: 100, completion_tokens: 8, ...raw };
 		mockState.chunks = [{ choices: [{ delta: { content: "ok" }, finish_reason: "stop" }], usage }];
 		const message = await completeSimple(
@@ -68,7 +67,6 @@ describe("openai-completions usage observation", () => {
 			{ messages: [{ role: "user", content: "hi", timestamp: 1 }] },
 			{
 				apiKey: "mock-only",
-				onOpenAICompletionsUsage: (event) => events.push(event),
 			},
 		);
 		expect(message.stopReason).toBe("stop");
@@ -78,12 +76,8 @@ describe("openai-completions usage observation", () => {
 			output: 8,
 			totalTokens: 108,
 		});
-		expect(events).toEqual([
-			{ source: "chunk.usage", chunkIndex: 1, usage, applied: true, normalized: message.usage },
-		]);
 	});
-	it("observes multiple cumulative chunks and ignored choice usage, without summing or changing priority", async () => {
-		const events: unknown[] = [];
+	it("uses the latest cumulative usage without summing", async () => {
 		mockState.chunks = [
 			{
 				choices: [
@@ -101,17 +95,29 @@ describe("openai-completions usage observation", () => {
 				usage: { prompt_tokens: 80, completion_tokens: 3, prompt_tokens_details: { cached_tokens: 50 } },
 			},
 		];
-		const message = await completeSimple(
-			openRouterAuto(),
-			{ messages: [] },
-			{ apiKey: "mock-only", onOpenAICompletionsUsage: (event) => events.push(event) },
-		);
-		expect(events).toMatchObject([
-			{ source: "choice.usage", chunkIndex: 1, applied: true, normalized: { cacheRead: 20 } },
-			{ source: "chunk.usage", chunkIndex: 2, applied: true, normalized: { cacheRead: 30 } },
-			{ source: "choice.usage", chunkIndex: 2, applied: false, normalized: { cacheRead: 30 } },
-			{ source: "chunk.usage", chunkIndex: 3, applied: true, normalized: { cacheRead: 50 } },
-		]);
+		const message = await completeSimple(openRouterAuto(), { messages: [] }, { apiKey: "mock-only" });
 		expect(message.usage).toMatchObject({ input: 30, output: 3, cacheRead: 50, totalTokens: 83 });
+	});
+	it.each([true, false])("prefers chunk usage and falls back to choice usage (chunk: %s)", async (hasChunkUsage) => {
+		mockState.chunks = [
+			{
+				choices: [
+					{
+						delta: { content: "ok" },
+						finish_reason: "stop",
+						usage: { prompt_tokens: 40, completion_tokens: 1, cached_tokens: 20 },
+					},
+				],
+				...(hasChunkUsage
+					? { usage: { prompt_tokens: 60, completion_tokens: 2, prompt_cache_hit_tokens: 30 } }
+					: {}),
+			},
+		];
+		const message = await completeSimple(openRouterAuto(), { messages: [] }, { apiKey: "mock-only" });
+		expect(message.usage).toMatchObject(
+			hasChunkUsage
+				? { input: 30, output: 2, cacheRead: 30, totalTokens: 62 }
+				: { input: 20, output: 1, cacheRead: 20, totalTokens: 41 },
+		);
 	});
 });

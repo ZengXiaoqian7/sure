@@ -24,7 +24,7 @@ function instruction(message: AgentMessage, runId: string): UserInstruction | un
 					.join("\n");
 	if (
 		!text.trim() ||
-		/^<sure_(?:invocation|stage_context|supervisor_repair)\b/.test(text) ||
+		/^<sure_(?:invocation|stage_context|supervisor_repair|supervisor_continue)\b/.test(text) ||
 		text.startsWith(`Sure run ${runId} is still active, but the last turn ended`)
 	)
 		return undefined;
@@ -69,7 +69,8 @@ export function syncSureUserContext(coordinator: SureCoordinator, messages: Agen
 	writeSureJson(path, saved);
 	if (!changed) return;
 	coordinator.state.evidenceVersion++;
-	if (coordinator.state.pendingRepair || coordinator.state.pendingDirectRepairId) {
+	coordinator.state.reviewedFailureVersion = undefined;
+	if (coordinator.state.pendingRepair || coordinator.state.unresolvedCheckVersion !== undefined) {
 		coordinator.invalidateRepair("User instructions changed.");
 		if (coordinator.state.status === "executing") coordinator.state.status = "yielding";
 		coordinator.state.yieldReason = "User instructions changed; the previous repair must be reconsidered.";

@@ -3,19 +3,22 @@ import { join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/compat";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { ExtensionContext } from "../../src/core/extensions/types.ts";
 import { captureSureExecutorProgress, planSureContextTrim, projectSureContext } from "../../src/core/sure/context.ts";
 import type { SureCoordinationState } from "../../src/core/sure/coordination-types.ts";
+import { SureCoordinator } from "../../src/core/sure/coordinator.ts";
+import type { SureRunRecord } from "../../src/core/sure/types.ts";
+import { syncSureUserContext } from "../../src/core/sure/user-context.ts";
 import { createHarness, getMessageText, type Harness } from "./harness.ts";
 
 const harnesses: Harness[] = [];
 const coordination: SureCoordinationState = {
-	version: 1,
+	version: 2,
 	runId: "run",
 	unitId: "current",
 	status: "executing",
 	evidenceVersion: 2,
 	updatedAt: "now",
-	units: {},
 	attempts: [],
 };
 const projection = (messages: AgentMessage[], purpose?: "execution" | "compaction") =>
@@ -56,25 +59,118 @@ afterEach(() => {
 });
 
 describe("Sure effective stage context", () => {
-	it("retains attributed public intent ahead of historical claims without exposing private thinking", async () => {
+	it("reconsiders new user constraints while ignoring its own continue message and duplicate delivery", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const coordinator = new SureCoordinator(
+			{
+				runId: "review",
+				runDir: harness.tempDir,
+				cwd: harness.tempDir,
+				packageDir: harness.tempDir,
+			} as SureRunRecord,
+			"current",
+			[],
+		);
+		const reviewed = () =>
+			coordinator.acceptDiagnosis({
+				runId: "review",
+				unitId: "current",
+				evidenceVersion: coordinator.state.evidenceVersion,
+				decision: "continue",
+				reason: "No correction justified",
+				facts: [],
+				hypotheses: [],
+				unknowns: [],
+				evidenceReferences: [`snapshot:${coordinator.state.latestSnapshot}`],
+				nextActions: [],
+			});
+		expect(reviewed()).toBe(true);
+		syncSureUserContext(coordinator, [
+			{
+				role: "user",
+				timestamp: 1,
+				content: "<sure_supervisor_continue>Continue normally</sure_supervisor_continue>",
+			},
+		]);
+		coordinator.requestDiagnosis("same basis");
+		expect(coordinator.state.status).toBe("executing");
+		syncSureUserContext(
+			coordinator,
+			[{ role: "user", timestamp: 2, content: "New constraint: preserve the CPU runtime" }],
+			true,
+		);
+		coordinator.requestDiagnosis("new constrained route needs help");
+		expect(coordinator.state.status).toBe("yielding");
+		expect(reviewed()).toBe(true);
+		syncSureUserContext(coordinator, [
+			{ role: "user", timestamp: 3, content: "New constraint: preserve the CPU runtime" },
+		]);
+		coordinator.requestDiagnosis("same delivered basis");
+		expect(coordinator.state.status).toBe("executing");
+	});
+	it("hands over bounded attributed public progress without private thinking or a new model call", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const run = { runDir: harness.tempDir } as Parameters<typeof captureSureExecutorProgress>[0];
+		const messages = Array.from({ length: 20 }, (_, index) =>
+			fauxAssistantMessage(
+				[
+					{ type: "thinking" as const, thinking: "PRIVATE_REASONING", thinkingSignature: "opaque" },
+					{ type: "text" as const, text: `${index}: public hypothesis ${"x".repeat(1500)}` },
+				],
+				{ timestamp: index + 1 },
+			),
+		);
+		const raw = JSON.stringify(messages);
+		const ids = new Map<AgentMessage, string>(messages.map((message, index) => [message, `message-${index}`]));
+		captureSureExecutorProgress(
+			run,
+			"current",
+			messages,
+			{ id: "main", data: { retries: { current: 2, irrelevant: 999 } } },
+			"/session.jsonl",
+			ids,
+		);
+		const path = join(harness.tempDir, "evidence/executor-progress.json");
+		const saved = readFileSync(path, "utf8");
+		const packet = JSON.parse(saved);
+		expect(JSON.stringify(packet).length).toBeLessThanOrEqual(4000);
+		expect(saved).not.toContain("PRIVATE_REASONING");
+		expect(saved).not.toContain("irrelevant");
+		expect(packet.attribution).toContain("claims, not verified");
+		expect(packet.omitted + packet.claims.length).toBe(20);
+		expect(packet.claims.at(-1)).toMatchObject({
+			timestamp: 20,
+			sourceMessageId: "message-19",
+			truncated: true,
+			sourceHash: expect.any(String),
+		});
+		const modifiedAt = statSync(path).mtimeMs;
+		captureSureExecutorProgress(
+			run,
+			"current",
+			messages,
+			{ id: "main", data: { retries: { current: 2 } } },
+			"/session.jsonl",
+			ids,
+		);
+		expect(statSync(path).mtimeMs).toBe(modifiedAt);
+		captureSureExecutorProgress(run, "current", [], undefined);
+		expect(JSON.parse(readFileSync(path, "utf8"))).toMatchObject({ claims: [], currentIntentAvailable: false });
+		expect(JSON.stringify(messages)).toBe(raw);
+	});
+	it("keeps current intent ahead of eight later historical claims and retains full public text", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
 		const run = { runDir: harness.tempDir } as Parameters<typeof captureSureExecutorProgress>[0];
 		const body = `${"Current reasoning. ".repeat(400)}NEXT_STEP: verify the actual loader before materializing.`;
 		const messages = [body, ...Array.from({ length: 8 }, () => "Historical observation. ".repeat(100))].map(
 			(text, index) =>
-				fauxAssistantMessage(
-					[
-						{ type: "thinking", thinking: "PRIVATE_REASONING", thinkingSignature: "opaque" },
-						{ type: "text", text },
-						fauxToolCall("read", {}, { id: `call-${index}` }),
-					],
-					{
-						timestamp: index + 1,
-					},
-				),
+				fauxAssistantMessage([{ type: "text", text }, fauxToolCall("read", {}, { id: `call-${index}` })], {
+					timestamp: index + 1,
+				}),
 		);
-		const original = JSON.stringify(messages);
 		const ids = new Map<AgentMessage, string>(messages.map((message, index) => [message, `message-${index}`]));
 		const units = new Map(messages.map((_, index) => [`call-${index}`, index ? "historical" : "current"]));
 		captureSureExecutorProgress(run, "current", messages, undefined, "/executor.jsonl", ids, 100, units);
@@ -82,13 +178,6 @@ describe("Sure effective stage context", () => {
 		const packet = JSON.parse(readFileSync(packetPath, "utf8"));
 		expect(JSON.stringify(packet).length).toBeLessThanOrEqual(4000);
 		expect(packet.currentIntentAvailable).toBe(true);
-		expect(packet.attribution).toContain("claims, not verified");
-		expect(packet.omitted + packet.claims.length).toBe(messages.length);
-		expect(JSON.stringify(packet)).not.toContain("PRIVATE_REASONING");
-		const modifiedAt = statSync(packetPath).mtimeMs;
-		captureSureExecutorProgress(run, "current", messages, undefined, "/executor.jsonl", ids, 100, units);
-		expect(statSync(packetPath).mtimeMs).toBe(modifiedAt);
-		expect(JSON.stringify(messages)).toBe(original);
 		const claim = packet.claims.find((claim: { unitId: string }) => claim.unitId === "current");
 		expect(claim).toMatchObject({ sourceMessageId: "message-0", truncated: true });
 		const source = JSON.parse(readFileSync(join(run.runDir, claim.sourcePath.slice(4)), "utf8"));
@@ -98,7 +187,6 @@ describe("Sure effective stage context", () => {
 			sourceHash: claim.sourceHash,
 			text: body,
 		});
-		expect(JSON.stringify(source)).not.toContain("PRIVATE_REASONING");
 		captureSureExecutorProgress(run, "current", messages.slice(1), undefined, "/executor.jsonl", ids, 100, units);
 		expect(JSON.parse(readFileSync(packetPath, "utf8")).currentIntentAvailable).toBe(false);
 		captureSureExecutorProgress(
@@ -129,18 +217,9 @@ describe("Sure effective stage context", () => {
 		expect(trimmed).toContain(failure);
 		expect(trimmed).toContain(native);
 		expect(trimmed).toContain(current);
-		expect(JSON.stringify(trimmed)).toContain("Keep CUDA");
-		expect(trimmed.filter((message) => message.role === "toolResult").map((message) => message.toolCallId)).toEqual([
-			"old-call",
-			"current-call",
-			"failed",
-			"native",
-		]);
 		expect(JSON.stringify(trimmed)).toContain("run:evidence/tools/");
 		expect(JSON.stringify(trimmed)).toContain("OLD_BULK");
 		expect(JSON.stringify(trimmed).length).toBeLessThan(JSON.stringify(messages).length);
-		expect(transcript).toHaveLength(5);
-		expect(JSON.stringify(transcript)).toContain("OLD_BULK".repeat(100));
 		expect(
 			projectSureContext([...trimmed, { role: "user", content: "next", timestamp: 500 }], selected).slice(
 				0,
@@ -209,20 +288,88 @@ describe("Sure effective stage context", () => {
 		expect(compact).not.toHaveBeenCalled();
 	});
 
+	it("keeps global constraints and complete current pairs, without changing the audit transcript", () => {
+		const effective = projectSureContext(transcript, planSureContextTrim(transcript, 200, coordination));
+		expect(JSON.stringify(effective).length).toBeLessThan(JSON.stringify(transcript).length);
+		expect(JSON.stringify(effective)).toContain("Keep CUDA");
+		expect(effective).toContain(current);
+		expect(effective.filter((message) => message.role === "toolResult").map((message) => message.toolCallId)).toEqual(
+			["old-call", "current-call"],
+		);
+		expect(transcript).toHaveLength(5);
+		expect(JSON.stringify(transcript)).toContain("OLD_BULK");
+		expect(projection(effective)).toHaveLength(effective.length);
+	});
+
+	it("supplies selected excerpts and current evidence to native manual compaction", async () => {
+		let context: ExtensionContext | undefined;
+		let compacted = "";
+		const harness = await createHarness({
+			models: [{ id: "small", contextWindow: 10_000, maxTokens: 1000 }],
+			settings: { compaction: { enabled: false, reserveTokens: 1000, keepRecentTokens: 1 } },
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_start", (_event, ctx) => {
+						context = ctx;
+						ctx.setContextProjection?.(projection);
+					});
+					pi.on("session_before_compact", (event) => {
+						compacted = JSON.stringify(event.preparation);
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		await harness.session.bindExtensions({});
+		for (const message of transcript) {
+			if (message.role === "user" || message.role === "assistant" || message.role === "toolResult")
+				harness.sessionManager.appendMessage(message);
+		}
+		harness.sessionManager.appendMessage(fauxAssistantMessage("Current completed work", { timestamp: 280 }));
+		harness.sessionManager.appendMessage({ role: "user", content: "Continue this unit", timestamp: 300 });
+		harness.sessionManager.appendMessage(fauxAssistantMessage("Current later work", { timestamp: 350 }));
+		harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
+		harness.setResponses([
+			fauxAssistantMessage("Compacted current stage"),
+			fauxAssistantMessage("Compacted turn prefix"),
+		]);
+		await harness.session.compact();
+		expect(compacted).toContain("OLD_BULK");
+		expect(compacted).toContain("Historical success excerpt");
+		expect(compacted).not.toContain("OLD_BULK".repeat(100));
+		expect(compacted).toContain("Current evidence");
+		expect(JSON.stringify(harness.sessionManager.getBranch())).toContain("OLD_BULK");
+		context?.setContextProjection?.(undefined);
+	});
+
+	it.each(["string", "array"])("leaves a delivered supervisor body unchanged with %s user content", (format) => {
+		const raw: AgentMessage[] = [
+			...transcript,
+			{
+				role: "user",
+				timestamp: 300,
+				content:
+					format === "string"
+						? '<sure_supervisor_repair id="current:2">UNIQUE_REPAIR</sure_supervisor_repair>'
+						: [
+								{
+									type: "text",
+									text: '<sure_supervisor_repair id="current:2">UNIQUE_REPAIR</sure_supervisor_repair>',
+								},
+							],
+			},
+		];
+		const effective = projectSureContext(raw, []);
+		expect(effective).toEqual(raw);
+		expect(JSON.stringify(effective).match(/UNIQUE_REPAIR/g)).toHaveLength(1);
+		expect(JSON.stringify(raw)).toContain("sure_supervisor_repair");
+	});
 	it.each([12, 50])("compacts %s old reads with real excerpts, fits actual requests and continues", async (count) => {
 		const sizes: number[] = [];
 		for (const projected of [false, true]) {
-			let compacted = "";
 			const harness = await createHarness({
 				models: [{ id: "small", contextWindow: 10_000, maxTokens: 1000 }],
 				settings: { compaction: { enabled: false, reserveTokens: 1000, keepRecentTokens: 300 } },
-				extensionFactories: [
-					(pi) => {
-						pi.on("session_before_compact", (event) => {
-							compacted = JSON.stringify(event.preparation);
-						});
-					},
-				],
 			});
 			harnesses.push(harness);
 			await harness.session.bindExtensions({});
@@ -298,15 +445,10 @@ describe("Sure effective stage context", () => {
 					for (const message of context.messages)
 						if (message.role === "toolResult") expect(calls).toContain(message.toolCallId);
 					if (projected) expect(text).toContain("CHECKPOINT: preserve CPU");
-					if (projected && !repeated) expect(text).toContain("Current evidence");
 					return fauxAssistantMessage("Continued after compaction");
 				}),
 			);
 			await harness.session.compact();
-			if (projected) {
-				expect(compacted).toContain("Historical success excerpt");
-				expect(compacted).not.toContain("bulk ".repeat(100));
-			}
 			expect(requests).toBeGreaterThan(0);
 			if (projected) expect(sawOriginal).toBe(true);
 			sizes.push(largest);

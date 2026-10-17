@@ -54,7 +54,7 @@ Isolation rule: `sure/models/<model_name>/` and its `artifacts/` directory must 
 
 Memory is advisory and agent-written. Verify it against current evidence. Read artifacts/memory_context.json during context_selection. On blocked gates, existing memory suggestions can help; never edit shared memory directly. Extraction and publishing keep their existing gate contracts.
 
-When the harness yields, finish no further task actions until it supplies a bounded supervisor repair task. Only the execution agent edits task files. Apply the repair within the current unit, preserve constraints, then let the original gate verify it. The supervisor cannot approve success or change the state machine.
+Fix clear local problems directly while actual checks establish progress. The harness automatically requests supervision when a complex or unknown blocker persists after a correction attempt, including actual call rejections. There is no executor help or evidence-return control. When the harness yields, wait for supervisor guidance. Only the execution agent edits task files. Follow one complete corrective goal, including any necessary probes and corrections, then use the original gate. Probe success is not business success. Continue normally after the gate passes, without returning results for supervisor approval. The supervisor cannot approve success or change the state machine. A diagnosis pause preserves the investigation for user recovery; it does not dispatch more executor work.
 
 ## Success Criteria
 

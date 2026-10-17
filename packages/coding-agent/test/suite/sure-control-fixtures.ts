@@ -1,11 +1,7 @@
-import { type AssistantMessage, fauxAssistantMessage, fauxToolCall, type ToolCall } from "@earendil-works/pi-ai/compat";
+import { type AssistantMessage, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/compat";
 import type { ExtensionContext } from "../../src/core/extensions/types.ts";
 import type { IsolatedSessionRequest } from "../../src/core/session-controls.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
-
-export function toolReply(...calls: ToolCall[]): AssistantMessage {
-	return fauxAssistantMessage(calls, { stopReason: "toolUse" });
-}
 
 export function fixtureTranscript(request: IsolatedSessionRequest, cwd: string) {
 	const manager = request.sessionFile
@@ -47,9 +43,16 @@ export async function submitControlFixture(
 }
 
 export function repairHandoff(task: string, focusPaths?: string[]): AssistantMessage {
-	return toolReply(fauxToolCall("sure_handoff_repair", { task, ...(focusPaths?.length ? { focusPaths } : {}) }));
+	return fauxAssistantMessage(
+		[fauxToolCall("sure_handoff_repair", { task, ...(focusPaths?.length ? { focusPaths } : {}) })],
+		{ stopReason: "toolUse" },
+	);
+}
+
+export function continueExecution(reason: string): AssistantMessage {
+	return fauxAssistantMessage([fauxToolCall("sure_continue_execution", { reason })], { stopReason: "toolUse" });
 }
 
 export function pauseDiagnosis(reason: string): AssistantMessage {
-	return toolReply(fauxToolCall("sure_pause_diagnosis", { reason }));
+	return fauxAssistantMessage([fauxToolCall("sure_pause_diagnosis", { reason })], { stopReason: "toolUse" });
 }

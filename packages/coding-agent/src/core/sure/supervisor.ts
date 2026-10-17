@@ -24,7 +24,6 @@ import {
 	sureActionDetails,
 	sureActionIndex,
 	sureCurrentRepairAttempt,
-	sureDiagnosticRange,
 	sureDiffIndex,
 	sureSnapshotForPath,
 } from "./diagnostic-view.ts";
@@ -33,7 +32,9 @@ import {
 	diffSureSnapshots,
 	evidencePathName,
 	readSureSnapshot,
+	resolveSureDiagnosticPath,
 	resolveSureEvidencePath,
+	sureDiagnosticTextAllowed,
 	sureEvidenceTextAllowed,
 	sureHash,
 	writeSureJson,
@@ -79,7 +80,7 @@ export async function diagnoseSureRun(
 	) {
 		try {
 			assertSureDiagnosticSourcesCurrent(coordinator.run, attempt.readKeys);
-			if (attempt.result?.decision === "repair") return parseSureDiagnosisResult(attempt.result);
+			if (attempt.result) return parseSureDiagnosisResult(attempt.result);
 		} catch (error) {
 			state.evidenceVersion++;
 			state.yieldReason = error instanceof Error ? error.message : String(error);
@@ -118,7 +119,6 @@ export async function diagnoseSureRun(
 	const started = Date.now();
 	const turnsBefore = activeAttempt.modelTurns;
 	const readsBefore = activeAttempt.readCalls;
-	const resumed = (activeAttempt.segments?.length ?? 0) > 0;
 	const segment = {
 		startedAt: new Date(started).toISOString(),
 		modelTurns: 0,
@@ -137,11 +137,9 @@ export async function diagnoseSureRun(
 	let accountedUsage = createUsageTotals();
 	let rejectCancellation: (() => void) | undefined;
 	let finished = false;
+	let endActivity: (() => void) | undefined;
 	let requestsBeforeTurn = activeAttempt.readRequests ?? activeAttempt.readCalls;
-	let timelineOffset = resumed ? (activeAttempt.timelineOffset ?? 0) : 0;
-	let timelineLength: number | undefined;
 	const userContext = readSureUserContext(coordinator);
-	let userContextRead = resumed ? (activeAttempt.userContextOffset ?? 0) : 0;
 	const update = (): void => {
 		assertRuntime();
 		const usage = isolated?.getUsage?.();
@@ -168,8 +166,6 @@ export async function diagnoseSureRun(
 		segment.modelTurns = activeAttempt.modelTurns - turnsBefore;
 		segment.readCalls = activeAttempt.readCalls - readsBefore;
 		segment.elapsedMs = Date.now() - started;
-		activeAttempt.timelineOffset = timelineOffset;
-		activeAttempt.userContextOffset = userContextRead;
 		coordinator.save();
 	};
 	const abort = (): void => {
@@ -196,7 +192,7 @@ export async function diagnoseSureRun(
 			);
 			reason = `${reason.slice(0, 3400)} [truncated; full diagnostic error retained in the attempt directory]`;
 		}
-		reason += ` Diagnosis segment usage: model turns ${activeAttempt.modelTurns - turnsBefore}, reads ${activeAttempt.readCalls - readsBefore}; macro delivered ${timelineOffset}/${timelineLength ?? "unknown"} characters.`;
+		reason += ` Diagnosis segment usage: model turns ${activeAttempt.modelTurns - turnsBefore}, reads ${activeAttempt.readCalls - readsBefore}.`;
 		activeAttempt.error = reason;
 		segment.error = reason;
 		const checkpoint: SureDiagnosisCheckpoint = {
@@ -206,15 +202,6 @@ export async function diagnoseSureRun(
 			decision: "checkpoint",
 			checkpoint: reason,
 			automatic: false,
-			facts: [state.lastCheck?.summary ?? "No validated completion was recorded."],
-			hypotheses: [],
-			unknowns: ["Diagnosis remains incomplete; this is not a business stop."],
-			evidenceReferences: ["run:coordination.json"],
-			nextActions: [],
-			nextReads: [],
-			candidateRange: activeAttempt.checkpoint?.candidateRange ?? null,
-			supportingEvidence: activeAttempt.checkpoint?.supportingEvidence ?? [],
-			opposingEvidence: activeAttempt.checkpoint?.opposingEvidence ?? [],
 		};
 		activeAttempt.checkpoint = checkpoint;
 		update();
@@ -246,24 +233,8 @@ export async function diagnoseSureRun(
 		modelTurns: { completed: activeAttempt.modelTurns - turnsBefore },
 		time: { elapsedMs: Date.now() - started },
 	});
-	const timelineProgress = () => ({
-		deliveredCharacters: timelineOffset,
-		totalCharacters: timelineLength ?? null,
-		complete: timelineLength !== undefined && timelineOffset === timelineLength,
-	});
-	const nextMacroRead = () => ({ operation: "timeline", offset: timelineOffset });
 	const protocolCalls = new Set<string>();
 	const usefulReadKeys = new Set(activeAttempt.readKeys ?? []);
-	const requireMacro = (message: string): never => {
-		throw new Error(
-			JSON.stringify({
-				error: message,
-				nextRead: nextMacroRead(),
-				timelineProgress: timelineProgress(),
-				budget: budget(),
-			}),
-		);
-	};
 	try {
 		const evidenceDir = join(coordinator.run.runDir, "evidence");
 		const stagePath = stage && resolveSurePackagePath(coordinator.run.packageDir, stage.prompt);
@@ -404,7 +375,7 @@ export async function diagnoseSureRun(
 					"run:": coordinator.run.runDir,
 				},
 				instruction:
-					"Read relevant text within these roots even when not captured. Snapshot coverage is not a read whitelist. Repair permissions remain separate.",
+					"Read relevant project and runtime source text, including absolute paths under existing filesystem permissions. Capture roots and snapshot coverage are not a live read whitelist. Sensitive files and binary payloads are excluded. Repair permissions remain separate.",
 			},
 			executorProgress:
 				currentSnapshot?.files.find((file) => file.path === "run:evidence/executor-progress.json")?.text ??
@@ -450,12 +421,6 @@ export async function diagnoseSureRun(
 							).filter((file) => !file.path.startsWith("run:evidence/tools/")),
 						)
 					: [],
-			units: Object.fromEntries(
-				Object.entries(state.units).map(([id, { calls, checks, noProgress, directRepairs, supervisorRepairs }]) => [
-					id,
-					{ calls, checks, noProgress, directRepairs, supervisorRepairs },
-				]),
-			),
 			previousDiagnoses: state.attempts
 				.filter((attempt) => attempt.id !== activeAttempt.id)
 				.map(({ id, unitId, evidenceVersion, result, error }) => ({
@@ -465,7 +430,8 @@ export async function diagnoseSureRun(
 					decision: result?.decision,
 					error: error ? true : undefined,
 				})),
-			repairs: (state.repairs ?? []).map(({ id, source, unitId, outcome }) => ({ id, source, unitId, outcome })),
+			repairs: (state.repairs ?? []).map(({ id, unitId, gateOutcome }) => ({ id, unitId, gateOutcome })),
+			actionIndex: sureActionIndex(index.actions),
 			currentAttempt,
 			priorUnitActions: sureActionIndex(
 				index.actions.filter(
@@ -480,15 +446,9 @@ export async function diagnoseSureRun(
 			},
 			repairDetails: { operation: "repairs", key: "repairId" },
 		};
-		const serializedTimeline = JSON.stringify(timeline);
-		const timelineHash = sureHash(serializedTimeline);
-		if (activeAttempt.timelineHash !== timelineHash) timelineOffset = 0;
-		activeAttempt.timelineHash = timelineHash;
-		timelineLength = serializedTimeline.length;
 		const operationParameters = {
 			timeline: ["offset"],
 			actions: ["offset", "toolCallId", "toolCallIds"],
-			range: ["offset", "startBatch", "endBatch"],
 			user_context: ["offset"],
 			checks: ["offset"],
 			hooks: ["offset", "hookId"],
@@ -505,12 +465,11 @@ export async function diagnoseSureRun(
 			name: "sure_diagnostic_read",
 			label: "Read SURE diagnostic evidence",
 			description:
-				"Read timeline first, including currentAttempt and priorUnitActions. snapshot/diff without path return indexes; with path they return saved content/diff. file/search inspect relevant text within project/package/run roots, independently of capture scope. search returns sourceOffset and line for file continuation. list(path) lists one directory level, never recursively. All evidence pages use nextOffset; text pages contain at most 2,000 lines or 50 KiB, without a total read allowance. Partial text is not complete inspection. No writes or process execution.",
+				"Inspect relevant evidence as needed from the initial navigation and current failure. snapshot/diff without path return indexes; with path they return saved content/diff. file/search inspect relevant source text, including absolute runtime paths, independently of capture scope. search returns sourceOffset and line for file continuation. list(path) lists one directory level, never recursively. Evidence pages use explicit nextOffset; text pages contain at most 2,000 lines or 50 KiB, without a total read allowance. Partial text is not complete inspection. No writes or process execution.",
 			parameters: Type.Object({
 				operation: StringEnum([
 					"timeline",
 					"actions",
-					"range",
 					"user_context",
 					"checks",
 					"hooks",
@@ -534,8 +493,6 @@ export async function diagnoseSureRun(
 				toolCallIds: Type.Optional(
 					Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: 4, uniqueItems: true }),
 				),
-				startBatch: Type.Optional(Type.String()),
-				endBatch: Type.Optional(Type.String()),
 			}),
 			execute: async (_id, params) => {
 				if (finished) throw new Error("Diagnosis segment has ended.");
@@ -553,21 +510,12 @@ export async function diagnoseSureRun(
 					throw new Error(
 						`Unsupported parameter ${unsupported} for ${params.operation}.${params.operation === "diff" ? " diff always compares the recorded baseline to the current snapshot; use snapshot to inspect a specific snapshotId." : ""}`,
 					);
-				if (!timelineProgress().complete && params.operation !== "timeline") {
-					protocolCalls.add(_id);
-					requireMacro("Read the complete macro timeline before inspecting local evidence.");
-				}
 				let value: unknown;
-				let offset = params.offset ?? 0;
+				const offset = params.offset ?? 0;
 				let fileIdentity:
 					| { path: string; source: "snapshot" | "file"; snapshotId?: string; sha256: string }
 					| undefined;
 				if (params.operation === "timeline") {
-					offset = params.offset ?? timelineOffset;
-					if (offset > timelineOffset) {
-						protocolCalls.add(_id);
-						requireMacro("Read the macro timeline sequentially; do not skip undelivered text.");
-					}
 					value = timeline;
 				} else if (params.operation === "actions") {
 					if (params.toolCallIds) {
@@ -588,14 +536,8 @@ export async function diagnoseSureRun(
 						if (!action) throw new Error("Unknown tool action identity.");
 						value = sureActionDetails(action);
 					} else value = sureActionIndex(index.actions);
-				} else if (params.operation === "range") {
-					value = sureDiagnosticRange(index, params.startBatch, params.endBatch);
 				} else if (params.operation === "user_context") {
-					const offset = params.offset ?? 0;
-					if (!Number.isSafeInteger(offset) || offset !== userContextRead)
-						throw new Error("Read user_context sequentially from its next offset.");
-					value = pageSureDiagnosticValue(userContext, offset);
-					userContextRead = (value as ReturnType<typeof pageSureDiagnosticValue>).nextOffset;
+					value = userContext;
 				} else if (params.operation === "checks") {
 					value = index.checks.map(({ version, check, snapshotId, timestamp, repairId }) => ({
 						version,
@@ -670,12 +612,8 @@ export async function diagnoseSureRun(
 					};
 				} else if (params.operation === "list") {
 					if (!params.path) throw new Error("Directory listing requires an explicit path.");
-					const path = resolveSureEvidencePath(coordinator.run, params.path);
-					if (!path)
-						throw new Error(
-							"Directory is outside authorized roots or resolves through a symlink escape; existence is unknown.",
-						);
-					if (!sureEvidenceTextAllowed(path)) throw new Error("Directory is excluded diagnostic evidence.");
+					const path = resolveSureDiagnosticPath(coordinator.run, params.path);
+					if (!sureDiagnosticTextAllowed(path)) throw new Error("Directory is excluded diagnostic evidence.");
 					if (!statSync(path).isDirectory()) throw new Error("Diagnostic listing requires a directory.");
 					value = {
 						path: evidencePathName(coordinator.run, path),
@@ -683,8 +621,8 @@ export async function diagnoseSureRun(
 						entries: readdirSync(path)
 							.sort()
 							.flatMap((name) => {
-								const child = resolveSureEvidencePath(coordinator.run, join(path, name));
-								if (!child || !sureEvidenceTextAllowed(child)) return [];
+								const child = resolveSureDiagnosticPath(coordinator.run, join(path, name));
+								if (!sureDiagnosticTextAllowed(child)) return [];
 								const stat = lstatSync(child);
 								return [
 									{
@@ -703,12 +641,9 @@ export async function diagnoseSureRun(
 					};
 				} else {
 					if (!params.path) throw new Error("File evidence requires an explicit path.");
-					const path = resolveSureEvidencePath(coordinator.run, params.path ?? "");
-					if (!path)
-						throw new Error(
-							"File is outside authorized diagnostic roots or resolves through a symlink escape; existence is unknown.",
-						);
-					if (!sureEvidenceTextAllowed(path)) throw new Error("This file is identity-only or excluded evidence.");
+					const path = resolveSureDiagnosticPath(coordinator.run, params.path);
+					if (!sureDiagnosticTextAllowed(path))
+						throw new Error("This file is identity-only or excluded evidence.");
 					// Prefer the retained version when captured; an uncaptured read is explicitly live.
 					const snapshot = params.snapshotId
 						? readSureSnapshot(coordinator.run, params.snapshotId)
@@ -741,38 +676,21 @@ export async function diagnoseSureRun(
 					};
 					value = params.operation === "search" ? searchSureDiagnosticText(text, params.query ?? "") : text;
 				}
-				let page = value;
-				if (params.operation !== "user_context") {
-					const evidencePage = pageSureDiagnosticValue(value, offset);
-					page = evidencePage;
-				}
-				const nextTimelineOffset =
-					params.operation === "timeline"
-						? Math.max(timelineOffset, (page as ReturnType<typeof pageSureDiagnosticValue>).nextOffset)
-						: timelineOffset;
-				const progress = {
-					deliveredCharacters: nextTimelineOffset,
-					totalCharacters: timelineLength,
-					complete: nextTimelineOffset === timelineLength,
-				};
+				const page = pageSureDiagnosticValue(value, offset);
 				const response = {
 					content: [
 						{
 							type: "text" as const,
 							text: JSON.stringify({
-								...(page as object),
+								...page,
 								...fileIdentity,
 								...(fileIdentity
 									? {
 											resolvedPath: evidencePathName(
 												coordinator.run,
-												resolveSureEvidencePath(coordinator.run, fileIdentity.path)!,
+												resolveSureDiagnosticPath(coordinator.run, fileIdentity.path),
 											),
 										}
-									: {}),
-								timelineProgress: progress,
-								...(!progress.complete
-									? { nextRead: { operation: "timeline", offset: nextTimelineOffset } }
 									: {}),
 								budget: budget(),
 							}),
@@ -780,15 +698,12 @@ export async function diagnoseSureRun(
 					],
 					details: { operation: params.operation, budget: budget() },
 				};
-				// No await between cursor validation, response serialization and commit:
-				// parallel execute() calls cannot interleave this delivery transaction.
-				timelineOffset = nextTimelineOffset;
 				const readIdentity = {
 					...params,
 					offset,
 					...(fileIdentity
 						? {
-								path: resolveSureEvidencePath(coordinator.run, fileIdentity.path),
+								path: resolveSureDiagnosticPath(coordinator.run, fileIdentity.path),
 								sha256: fileIdentity.sha256,
 								source: fileIdentity.source,
 								snapshotId: fileIdentity.snapshotId,
@@ -812,24 +727,24 @@ export async function diagnoseSureRun(
 		let submitted: SureDiagnosisOutcome | undefined;
 		let turnError: Error | undefined;
 		let feedback =
-			"Use sure_handoff_repair with a nonempty task, or sure_pause_diagnosis with a reason. Business stop is disabled.";
+			"Use sure_handoff_repair for a corrective task, sure_continue_execution for the existing plan, or sure_pause_diagnosis. Business stop is disabled.";
 		let readFrontier = new Set(usefulReadKeys);
 		const handoffTool = defineTool({
 			name: "sure_handoff_repair",
 			label: "Hand a repair task to the executor",
 			description:
-				"Submit one natural-language repair or evidence task. The harness attaches identity and validates the original gate. Optional focusPaths are suggestions, not write restrictions. No report JSON or business stop.",
-			parameters: Type.Object({
-				task: Type.String({ minLength: 1, maxLength: 32_000, pattern: "\\S" }),
-				focusPaths: Type.Optional(
-					Type.Array(Type.String({ minLength: 1, maxLength: 32_000 }), { minItems: 1, maxItems: 256 }),
-				),
-			}),
+				"Submit one complete natural-language task. Include any required probe, correction and validation in this complete goal; the executor does not return results for supervisor approval. The original gate remains authoritative. Optional focusPaths are suggestions, not write restrictions.",
+			parameters: Type.Object(
+				{
+					task: Type.String({ minLength: 1, maxLength: 32_000, pattern: "\\S" }),
+					focusPaths: Type.Optional(
+						Type.Array(Type.String({ minLength: 1, maxLength: 32_000 }), { minItems: 1, maxItems: 256 }),
+					),
+				},
+				{ additionalProperties: false },
+			),
 			execute: async (callId, params) => {
 				assertTicket();
-				if (!timelineProgress().complete) requireMacro("Read the complete macro timeline before handing off.");
-				if (userContextRead !== userContext.length)
-					throw new Error("Read complete user_context before handing off.");
 				assertSureDiagnosticSourcesCurrent(coordinator.run, activeAttempt.readKeys);
 				for (const target of params.focusPaths ?? []) {
 					const path = resolveSureEvidencePath(coordinator.run, target);
@@ -856,7 +771,7 @@ export async function diagnoseSureRun(
 					targetFiles: [],
 					validation: "The unchanged original unit gate validates the actual result.",
 					stopBoundary:
-						"Return an actual failed recheck of the original condition for reassessment. Independent errors have their own local correction; related objects remain within the complete goal. Supervisor business stop is disabled.",
+						"Continue clear local corrections. The harness investigates continued actual failures without verified local progress, including changed or uncertain errors. A passed original gate does not require routine reassessment. Supporting probes belong to the complete correction; there is no evidence-return or approval workflow. Supervisor business stop is disabled.",
 				};
 				candidates.push({ callId, result });
 				return {
@@ -871,7 +786,7 @@ export async function diagnoseSureRun(
 			name: "sure_pause_diagnosis",
 			label: "Pause this investigation",
 			description:
-				"Save a resumable diagnostic checkpoint. Does not terminate the business task or consume gate retries.",
+				"Save a resumable diagnostic checkpoint only when the investigation itself cannot proceed, for user recovery. Missing evidence in the initial packet requires autonomous investigation. Do not dispatch executor work or request results for later approval. Does not terminate the business task or consume gate retries.",
 			parameters: Type.Object({ reason: Type.String({ minLength: 1, maxLength: 4000, pattern: "\\S" }) }),
 			execute: async (callId, params) => {
 				assertTicket();
@@ -884,21 +799,58 @@ export async function diagnoseSureRun(
 						decision: "checkpoint",
 						checkpoint: params.reason,
 						automatic: false,
-						facts: [],
-						hypotheses: [],
-						unknowns: ["Investigation paused; no business stop."],
-						nextActions: [],
-						evidenceReferences: [],
-						nextReads: [],
-						candidateRange: null,
-						supportingEvidence: [],
-						opposingEvidence: [],
 					},
 				});
 				return { content: [{ type: "text", text: "Diagnostic pause candidate recorded." }], details: {} };
 			},
 		});
-		const definitions = [readTool, handoffTool, pauseTool];
+		const continueTool = defineTool({
+			name: "sure_continue_execution",
+			label: "Continue the executor's existing plan",
+			description:
+				"Return execution to the unchanged current task with concrete guidance, without inventing a correction.",
+			parameters: Type.Object({ reason: Type.String({ minLength: 1, maxLength: 4000, pattern: "\\S" }) }),
+			execute: async (callId, params) => {
+				assertTicket();
+				assertSureDiagnosticSourcesCurrent(coordinator.run, activeAttempt.readKeys);
+				candidates.push({
+					callId,
+					result: {
+						runId: state.runId,
+						unitId: ticket.unitId,
+						evidenceVersion: ticket.evidenceVersion,
+						decision: "continue",
+						reason: params.reason,
+						facts: [],
+						hypotheses: [],
+						unknowns: [],
+						nextActions: [],
+						evidenceReferences: latestId ? [`snapshot:${latestId}`] : [],
+					},
+				});
+				return { content: [{ type: "text", text: "Continue candidate recorded." }], details: {} };
+			},
+		});
+		const definitions = [readTool, handoffTool, pauseTool, continueTool];
+		const showActivity = (event: Parameters<NonNullable<typeof ctx.ui.showAgentActivity>>[0]["event"]) => {
+			if (finished || coordinator.supervisorRuntime !== runtimeId) return;
+			try {
+				if (event.type === "end") assertRuntime();
+				else assertTicket();
+				ctx.ui.showAgentActivity?.({
+					role: "supervisor",
+					runId: state.runId,
+					attemptId: activeAttempt.id,
+					runtimeId,
+					event,
+					tool: "toolName" in event ? definitions.find((tool) => tool.name === event.toolName) : undefined,
+				});
+			} catch {
+				// Display failures and stale callbacks must not affect investigation control.
+			}
+		};
+		showActivity({ type: "start" });
+		endActivity = () => showActivity({ type: "end" });
 		const validators = new Map(definitions.map((tool) => [tool.name, Compile(tool.parameters)]));
 		const creation = prepareSureSupervisorSession(coordinator);
 		const savedSession = state.supervisorSession;
@@ -914,9 +866,10 @@ export async function diagnoseSureRun(
 		isolated = await Promise.race([
 			ctx
 				.createIsolatedSession({
-					systemPrompt: `You are SURE's independent read-only supervisor. Business termination is disabled. Investigate then call sure_handoff_repair with one natural-language task, or sure_pause_diagnosis to save a recoverable checkpoint. Do not return a final report JSON. Never modify business files, invoke shell commands, approve success, change user constraints or reset original retries. Keep evidence references, hypotheses and counterevidence in your public notes when useful.\n${globalContext}`,
+					systemPrompt: `You are SURE's independent read-only debugger. Investigate relevant state, code and evidence using your tools. Hand back a complete corrective task, continue the existing executor plan, or pause with a recoverable reason. Do not return a final report JSON. Never modify business files, invoke shell commands, approve success, change user constraints or reset original retries. Keep evidence references, hypotheses and counterevidence in your public notes when useful.\n${globalContext}`,
 					...creation,
 					tools: definitions,
+					onActivity: showActivity,
 					onCompaction: () => {
 						if (finished || coordinator.supervisorRuntime !== runtimeId) return;
 						activeAttempt.compactionCalls = (activeAttempt.compactionCalls ?? 0) + 1;
@@ -943,8 +896,9 @@ export async function diagnoseSureRun(
 							}
 							const conflict =
 								candidates.length > 1 ||
-								calls.filter((call) => call.name === handoffTool.name || call.name === pauseTool.name).length >
-									1;
+								calls.filter((call) =>
+									[handoffTool.name, pauseTool.name, continueTool.name].includes(call.name),
+								).length > 1;
 							const badCall = calls.some((call) => {
 								if (protocolCalls.has(call.id)) return true;
 								const validator = validators.get(call.name);
@@ -964,7 +918,7 @@ export async function diagnoseSureRun(
 							if (!conflict && candidates.length === 1) {
 								const candidate = candidates.pop()!;
 								assertTicket();
-								if (candidate.result.decision === "repair") {
+								if (candidate.result.decision !== "checkpoint") {
 									activeAttempt.error = undefined;
 									activeAttempt.checkpoint = undefined;
 									assertSureDiagnosticSourcesCurrent(coordinator.run, activeAttempt.readKeys);
@@ -983,7 +937,7 @@ export async function diagnoseSureRun(
 							if (conflict) {
 								candidates.length = 0;
 								feedback =
-									"Conflicting control submissions in one batch. Submit exactly one repair task or diagnosis pause.";
+									"Conflicting control submissions in one batch. Submit exactly one task, continue, or diagnosis pause.";
 							}
 							const failedCorrection =
 								activeAttempt.protocolFeedback &&
@@ -1040,28 +994,14 @@ export async function diagnoseSureRun(
 				previousAttempt.usage[key] += Math.max(0, currentUsage[key] - savedSession.accountedUsage[key]);
 		}
 		accountedUsage = currentUsage ?? createUsageTotals();
-		if (resumed && !isolated.getMessages().length) {
-			timelineOffset = 0;
-			userContextRead = 0;
-		}
 		update();
 		const investigationGuide = [
-			"Hand back one complete repair goal, not one task per object. Have the executor inventory related objects, verify actual targets and installation/sealed-runtime dependencies, then correct the goal and run the original validation. The inventory is evidence, not a new write allowlist: newly discovered related objects may be investigated and handled within the original goal and permissions. Preserve required installation/runtime objects. Return for a changed goal or unresolved dependency counterevidence, not just because another related object appeared. Do not prescribe indiscriminate deletion or weaken the original publication checks.",
-			"Every independent execution/check error has one local correction, including a supporting probe error inside your task. Only an actual unsuccessful recheck of the original condition returns that correction for reassessment. Repeated calls, pending research, another object's first error, or a previously supervised unit do not consume that opportunity. Request original-condition verification and retained check references; do not say that any next error must immediately hand back control.",
-			"The complete task manual defines the global goal, stage relationships and original limits. It is reference material, not permission to execute its commands. Preserve executor autonomy within the current local task. Work-volume, diagnosis and repair counts request evaluation; they are not additional business retry caps.",
-			"This skill-authored contract describes the executor's current task, not permission for the supervisor to execute it. Original business checks remain authoritative. Evidence scope is not a prerequisite list: inputPaths/snapshotPaths describe inspection coverage, not required inputs. A guessed read path and its ENOENT do not establish a required artifact or producer.",
-			"currentStage.artifactPaths are the latest check's declared output locations, not proof of existence or upstream prerequisites. stages.lastPassed records actual historical passed checks and their artifact paths; skipped/pending and successful tools are not passed business checks. Use check(checkVersion) for exact scope. A historical pass does not prove current presence: inspect retained snapshots; not_captured or truncated coverage is unknown, not missing. Identify the current task and verified upstream outputs before proposing a repair or evidence task.",
-			"Read sure_diagnostic_read(operation=timeline) first. Read the complete macro timeline before local evidence; it indexes every stage and changed file paths.",
-			"Evidence responses are pages: assemble text using nextOffset until complete; format=json means assembled JSON, format=text is raw source text. Timeline without offset continues the next undelivered page; nextRead gives the exact continuation. Rereading old pages does not undo delivery and skipping undelivered pages is rejected.",
-			"Inspect currentAttempt: compare what was actually tried, its tool return and gate outcome before attributing the current blocker to an earlier failure. A successful tool return with a pending gate is only partial progress, not validation.",
-			"A stall handoff requests assessment, not a business failure. Inspect priorUnitActions for relevant sources and probes before the trigger. executorProgress contains attributed public claims: explicitly assess the executor's pending next step as viable, contradicted or needing evidence. Continue a useful documented current-unit action with a bounded command-only repair instead of inventing an external prerequisite. Retain the original gate and retry state.",
-			"currentAttempt is an action index, grouped by trigger/subsequent batch; same-batch observations are not post-feedback repairs. In actions, inputTruncated=true marks shortened input. Use actions(toolCallId) to inspect selected input/return previews. Read the full saved path when a preview is incomplete or more detail is needed; complete previews need not be mechanically reread. Saved action files are read-only. If task.userContext.characters is nonzero, read user_context sequentially until complete before deciding; user instructions remain authoritative.",
-			"Macro repair/diagnosis entries contain identities and outcomes only. repairs(repairId) retains the full task, checks and before/after snapshots. Prior diagnosis results are readable with file(path=run:diagnoses/<id>/result.json); use their exact indexed IDs. Action inputs are in actions or actions(toolCallId), not the mandatory currentAttempt index.",
-			"Operations checks, hooks(hookId), check(checkVersion), repairs(repairId), snapshot, diff and log provide details. list(path) discovers one directory level within readScope.roots; file/search read relevant root-contained text even outside the capture declaration. Use project: for repository config or shared code and package: for skill-local paths. resolvedPath identifies the canonical root spelling. Do not infer absence from a permission error. For sources outside these roots, give the executor a bounded official resolver probe under its existing permissions.",
-			"diff(path?,offset?) always compares the indexed baseline to the current barrier and returns their snapshotReferences; it does not accept snapshotId. snapshot/file/search accept snapshotId. Unsupported operation parameters are rejected and still cost a read. Default diffs exclude action-file capture noise; an explicit action path remains inspectable.",
-			"Every search/page costs one read. Read only relevant local evidence; unread code remains unknown.",
-			"Ordinary file references must exist and be authorized diagnostic text. A missing file itself is not a valid file reference, even if it appears in scope or diff. Cite the snapshot:<id> or check:<version> retaining that absence and name the path/status in your explanation. diffEvidence and diff.snapshotReferences identify the saved before/after snapshots. not_captured does not prove absence. Never create placeholder evidence or infer a producer from a filename.",
-			"Use complete-batch range(startBatch,endBatch) to bisect after the macro. Keep left/right/both/unknown hypotheses and counterevidence; return to the parent range when contradicted. Verify the final neighborhood and later corrections. The goal is a current repairable condition, not necessarily the earliest error. actions(toolCallIds) reads at most four explicit IDs; continue any partial page using nextOffset. diffIndex encoding expands each path as directory + basename, grouped by before/after status; not_captured is unknown. A repair's stop boundary returns the failed attempt for reassessment; it does not terminate the unit while the original gate allows attempts.",
+			"Investigate one complete current condition, not one task per object. Read global instructions, current task, user constraints and actual actions together. Preserve executor autonomy and necessary installation/runtime objects; focusPaths are hints, never a new write allowlist. Work-volume and repair counts are observations, not new business retry caps.",
+			"The original business checks remain authoritative. Evidence scope is not a prerequisite list: inputPaths/snapshotPaths describe inspection coverage, not required inputs. A guessed read path and its ENOENT do not establish a required artifact or producer. A successful tool result is not a passed gate; a historical pass does not prove current file presence. not_captured or truncated coverage is unknown, not missing.",
+			"The initial navigation covers every stage and action identity, current failure and correction records. Use actions/checks/hooks/repairs for details and file/search/list to inspect relevant project or runtime sources, including absolute paths. Runtime dependency source text is readable; secrets, weights and binary payloads are excluded. No shell or process execution is available. If a real probe is needed, include it with the resulting corrective steps and original validation in one complete guidance task. Do not ask the executor to collect results and return for approval.",
+			"Evidence responses are pages: assemble text using explicit nextOffset until complete when full inspection matters. format=json means assembled JSON; format=text is raw source text. Search offsets use the same character units as file reads. No mandatory navigation reread or binary-search procedure applies. Clear local corrections remain with the executor; continued actual failures or uncertain relationships warrant timely help. Same-batch results are not post-feedback corrections.",
+			"Inspect what the executor actually tried and its current intended next step before attributing the blocker to an earlier failure. Request a repair only when evidence supports changing the action. Use sure_continue_execution with concrete guidance when the existing plan remains viable; it creates no repair. Missing initial evidence requires autonomous reads; necessary real probes belong in complete corrective guidance, never an evidence-return task. Use sure_pause_diagnosis only when the investigation itself cannot proceed and needs user recovery. Only the original business lifecycle can end the task.",
+			"Snapshot reads preserve historical versions. Uncaptured live files are labeled with their source and hash; changed live sources invalidate a pending conclusion. A missing file itself is not a valid file reference: cite the check or snapshot that records its absence. diff compares the recorded baseline and current snapshot; use snapshotId for another saved version. Public notes should distinguish facts, hypotheses and counterevidence. Do not infer absence from a permission error.",
 		].join("\n\n");
 		const packet = {
 			runId: state.runId,
@@ -1075,6 +1015,7 @@ export async function diagnoseSureRun(
 			latestCheck: currentCheck?.check ?? null,
 			previousRepair: state.repairs?.at(-1),
 			checkpoint: activeAttempt.checkpoint ?? null,
+			navigation: timeline,
 			lastProtocolFeedback: activeAttempt.protocolLastError ?? null,
 			scope: visibleRepairScope,
 			usage: budget(),
@@ -1084,7 +1025,7 @@ export async function diagnoseSureRun(
 			JSON.stringify(packet) +
 			"\n\n" +
 			investigationGuide +
-			"\nRead the complete current macro timeline and user instructions, then inspect relevant evidence. No additional investigation read/turn/time cap. Preserve public evidence notes with references across handoffs. Submit a repair task or diagnosis pause using its tool; no final report JSON.";
+			"\nInvestigate relevant evidence using your tools; the navigation is an index, not a root-cause conclusion. No additional investigation read/turn/time cap. Preserve public evidence notes with references across handoffs. Submit one task, continue, or diagnosis pause using its tool; no final report JSON.";
 		while (!submitted) {
 			await Promise.race([isolated.prompt(prompt), interruption]);
 			if (turnError) throw turnError;
@@ -1104,6 +1045,7 @@ export async function diagnoseSureRun(
 		try {
 			if (isolated && coordinator.supervisorRuntime === runtimeId) update();
 		} finally {
+			endActivity?.();
 			finished = true;
 			if (coordinator.supervisorRuntime === runtimeId) coordinator.supervisorRuntime = undefined;
 			if (coordinator.diagnosisAbortController === cancellation) coordinator.diagnosisAbortController = undefined;

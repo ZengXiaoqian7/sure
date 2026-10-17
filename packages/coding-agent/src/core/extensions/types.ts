@@ -55,7 +55,7 @@ import type { KeybindingsManager } from "../keybindings.ts";
 import type { CustomMessage } from "../messages.ts";
 import type { ModelRegistry } from "../model-registry.ts";
 import type { ScopedModel } from "../model-resolver.ts";
-import type { IsolatedSessionFactory, SessionContextProjection } from "../session-controls.ts";
+import type { IsolatedSessionActivity, IsolatedSessionFactory, SessionContextProjection } from "../session-controls.ts";
 import type {
 	BranchSummaryEntry,
 	CompactionEntry,
@@ -67,6 +67,7 @@ import type {
 import type { SlashCommandInfo } from "../slash-commands.ts";
 import type { SourceInfo } from "../source-info.ts";
 import type { BuildSystemPromptOptions } from "../system-prompt.ts";
+import type { ToolCallRejection } from "../tool-call-rejection.ts";
 import type { BashOperations } from "../tools/bash.ts";
 import type { EditToolDetails } from "../tools/edit.ts";
 import type {
@@ -131,7 +132,18 @@ export type EditorFactory = (tui: TUI, theme: EditorTheme, keybindings: Keybindi
  * UI context for extensions to request interactive UI.
  * Each mode (interactive, print) provides its own implementation.
  */
+export interface AgentActivity {
+	role: string;
+	runId: string;
+	attemptId: string;
+	runtimeId: string;
+	event: IsolatedSessionActivity | { type: "start" } | { type: "end" };
+	tool?: ToolDefinition;
+}
+
 export interface ExtensionUIContext {
+	/** Presentation only: never enters the executor transcript or tool hooks. */
+	showAgentActivity?(activity: AgentActivity): void;
 	/** Show a selector and return the user's choice. */
 	select(title: string, options: string[], opts?: ExtensionUIDialogOptions): Promise<string | undefined>;
 
@@ -826,6 +838,8 @@ export interface ToolExecutionEndEvent {
 	toolName: string;
 	result: any;
 	isError: boolean;
+	/** Present only when a projected session observed an actual rejection. */
+	rejection?: ToolCallRejection;
 }
 
 // ============================================================================

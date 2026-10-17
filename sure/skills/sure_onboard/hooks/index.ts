@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync } from "node:fs";
 import { delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type { SureCheckEvidence, SureHookContext, SureHookResult } from "@earendil-works/pi-coding-agent/hooks";
 import { agentBinDir, demoteAgentBinDir } from "../../../runtime/agent-path.ts";
@@ -929,6 +929,8 @@ function checkEvidence(
 		unitId: unit.id,
 		outcome,
 		failureKind,
+		condition: gate?.condition,
+		localProgress: gate?.localProgress,
 		diagnosticPaths:
 			unit.id === "load_model_input" ? ["run:evidence/invocation.json", ...(modelInput ? [modelInput] : [])] : [],
 		summary,
@@ -971,12 +973,58 @@ export function postToolResult(ctx: SureHookContext): SureHookResult {
 	const event = isRecord(ctx.event) ? ctx.event : {};
 	const checkpoint = readCheckpoint(ctx);
 	const currentUnit = findUnit(checkpoint.data.currentUnit);
+	// Optional routing observations stay local to this skill. They cannot pass a gate.
+	let prior: SureCheckEvidence | undefined;
+	try {
+		const state = JSON.parse(readFileSync(join(ctx.runDir, "coordination.json"), "utf8"));
+		if (state.lastFailure?.unitId === currentUnit?.id) prior = state.lastFailure;
+	} catch {
+		// Missing or historical coordination data is unknown, never proof of progress.
+	}
 	if (event.isError === true) {
+		let condition: SureCheckEvidence["condition"];
+		let localProgress: boolean | undefined;
+		const command = isRecord(event.input) && typeof event.input.command === "string" ? event.input.command : "";
+		if (invokedSkillScripts(command).includes("scripts/finalize_model_bundle.py") && Array.isArray(event.content)) {
+			const modelDir = modelDirFromResolvedArtifact(ctx);
+			for (const block of event.content) {
+				if (!isRecord(block) || block.type !== "text" || typeof block.text !== "string") continue;
+				for (const line of block.text.split("\n")) {
+					if (!line.startsWith("SURE_FAILURE_OBSERVATION=")) continue;
+					try {
+						const value: unknown = JSON.parse(line.slice("SURE_FAILURE_OBSERVATION=".length));
+						if (
+							!modelDir ||
+							!isRecord(value) ||
+							value.id !== "directory_symlink" ||
+							typeof value.target !== "string"
+						)
+							continue;
+						const target = resolve(modelDir, value.target);
+						const path = relative(resolve(modelDir), target);
+						if (!path || path.startsWith("..") || isAbsolute(path) || !lstatSync(target).isSymbolicLink())
+							continue;
+						condition = { id: "directory_symlink", target, localRepair: true };
+						const previous = prior?.condition;
+						if (previous?.id === condition.id && previous.target && previous.target !== target) {
+							const oldPath = relative(resolve(modelDir), previous.target);
+							if (oldPath && !oldPath.startsWith("..") && !isAbsolute(oldPath)) {
+								const corrected = lstatSync(previous.target);
+								localProgress = corrected.isDirectory() && !corrected.isSymbolicLink();
+							}
+						}
+					} catch {
+						// Unverified observations do not grant another local correction.
+					}
+				}
+			}
+		}
 		return {
 			ok: true,
 			check: {
 				...checkEvidence(ctx, currentUnit ?? FIRST_UNIT, "blocked", "tool", "Execution tool returned an error."),
-				recovery: "local_once",
+				condition,
+				localProgress,
 				repair: "Inspect the tool output, repair the command or artifact, and continue.",
 			},
 			state_patch: {
@@ -1005,6 +1053,14 @@ export function postToolResult(ctx: SureHookContext): SureHookResult {
 		return unchangedFailure;
 	}
 	const producesResult = validateProduces(ctx, currentUnit, artifact);
+	if (
+		producesResult.condition?.localRepair &&
+		prior?.condition?.id === "required_field" &&
+		prior.condition.target &&
+		isRecord(artifact)
+	) {
+		producesResult.localProgress = Object.hasOwn(artifact, prior.condition.target);
+	}
 	if (!producesResult.ok) {
 		if (producesResult.missing) {
 			// "missing" also covers "present but not JSON": readArtifact returns undefined for both.
@@ -1030,6 +1086,7 @@ export function postToolResult(ctx: SureHookContext): SureHookResult {
 			producesResult.repair ?? `Unit "${currentUnit.id}" produces invalid.`,
 			producesResult.reason ?? "produces invalid",
 			"format",
+			producesResult,
 		);
 	}
 

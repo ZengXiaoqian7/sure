@@ -120,12 +120,11 @@ Our pi is pi 0.85.1 plus the patches below. This list is the record; keep it cur
 - Azure default model `gpt-5.5`.
 - A `ModelRegistry.login()` facade over the SURE auth adapter `src/core/sure/auth.ts`.
 - SURE run settlement on `agent_settled` instead of `agent_end` / `willRetry`.
-- Opt-in SURE coordination: structured check evidence, persisted budgets/snapshots/diagnoses, native stage-message continuity, compaction-boundary history trimming, redacted provider evidence, and isolated read-only supervisor sessions. Generic session controls bridge execution holds to agent-core's `shouldStopAfterTurn`; raw session history remains intact.
+- Opt-in SURE coordination: version 2 failure/review positions, snapshots/diagnoses and complete corrective/continue guidance with harness-only failure/rejection routing; native stage-message continuity and compaction-boundary history trimming; persistent autonomous read-only supervisor sessions with actual role-tagged tool activity. Generic session controls bridge execution holds to agent-core's `shouldStopAfterTurn`; raw session history remains intact. Business gates/retries/finish retain their authority; no workload takeover or per-error quota tree.
 - `callContextHandlerAbortable` in `src/core/extensions/runner.ts`, so `context` event handlers abort with `ctx.signal` instead of running to completion after a cancelled run.
 
 `packages/ai`:
 
-- An opt-in OpenAI completions usage-ingress observer for SURE diagnostics; usage parsing and request parameters are unchanged.
 - Dropped the dead `|| "Unknown error"` short-circuit in the Responses error template.
 - `error-body.ts` reads a three-digit numeric-string `code` as a status and exposes bodies that carry no status.
 - Responses `cancelled` and `failed` carry `errorMessage: "Response <status>"`.

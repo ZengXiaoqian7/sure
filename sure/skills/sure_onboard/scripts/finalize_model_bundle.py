@@ -42,6 +42,17 @@ DELIVERY_ARTIFACTS = (
 )
 
 
+class DirectorySymlinkError(ValueError):
+    """A concrete, locally repairable bundle condition, not a gate approval."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        super().__init__(
+            f"directory symlink is not publishable: {path}; "
+            "materialize the directory or use file-level symlinks"
+        )
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -78,10 +89,7 @@ def ensure_safe_bundle_targets(model_dir: Path, resolved: dict[str, Any]) -> Non
         for child in directory.iterdir():
             if child.is_symlink():
                 if child.resolve().is_dir():
-                    raise ValueError(
-                        f"directory symlink is not publishable: {child}; "
-                        "materialize the directory or use file-level symlinks"
-                    )
+                    raise DirectorySymlinkError(child)
                 continue
             if child.is_dir():
                 pending.append(child)
@@ -525,6 +533,10 @@ def main() -> int:
         deployment = finalize(args.run_dir.expanduser().resolve(), args.produces.expanduser().resolve())
     except (OSError, ValueError) as exc:
         print(f"finalize_model_bundle failed: {exc}", file=sys.stderr)
+        if isinstance(exc, DirectorySymlinkError):
+            print("SURE_FAILURE_OBSERVATION=" + json.dumps({
+                "id": "directory_symlink", "target": str(exc.path), "localRepair": True,
+            }), file=sys.stderr)
         return 1
     print(f"finalize_model_bundle OK: status={deployment['status']}, model={deployment['model_name']}")
     return 0

@@ -21,6 +21,7 @@ export type {
 export { ExtensionRunner, noOpUIContext } from "./runner.ts";
 export type {
 	AfterProviderResponseEvent,
+	AgentActivity,
 	AgentEndEvent,
 	AgentSettledEvent,
 	AgentStartEvent,

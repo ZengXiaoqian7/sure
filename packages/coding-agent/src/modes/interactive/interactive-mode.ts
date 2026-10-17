@@ -63,6 +63,7 @@ import {
 } from "../../core/cache-stats.ts";
 import { DEFAULT_THINKING_LEVEL, THINKING_LEVEL_OPTIONS } from "../../core/defaults.ts";
 import type {
+	AgentActivity,
 	AutocompleteProviderFactory,
 	EditorFactory,
 	ExtensionCommandContext,
@@ -75,6 +76,7 @@ import type {
 	ProjectTrustContext,
 	WorkingIndicatorOptions,
 } from "../../core/extensions/index.ts";
+import type { ToolRenderContext } from "../../core/extensions/types.ts";
 import { FooterDataProvider, type ReadonlyFooterDataProvider } from "../../core/footer-data-provider.ts";
 import { configureHttpDispatcher, formatHttpIdleTimeoutMs } from "../../core/http-dispatcher.ts";
 import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.ts";
@@ -407,6 +409,8 @@ export class InteractiveMode {
 
 	// Tool execution tracking: toolCallId -> component
 	private pendingTools = new Map<string, ToolExecutionComponent>();
+	private activeAgentActivity: string | undefined;
+	private agentActivityTools = new Map<string, ToolExecutionComponent>();
 
 	// Tool output expansion state
 	private toolOutputExpanded = false;
@@ -2013,7 +2017,9 @@ export class InteractiveMode {
 		this.showStatusIndicator(
 			new WorkingStatusIndicator(
 				this.ui,
-				this.workingMessage ?? this.defaultWorkingMessage,
+				this.activeAgentActivity
+					? "Supervisor · reviewing evidence and preparing guidance…"
+					: (this.workingMessage ?? this.defaultWorkingMessage),
 				this.workingIndicatorOptions,
 				colorFn,
 			),
@@ -2294,6 +2300,7 @@ export class InteractiveMode {
 
 	private createExtensionUIContext(): ExtensionUIContext {
 		return {
+			showAgentActivity: (activity) => this.showAgentActivity(activity),
 			select: (title, options, opts) => this.showExtensionSelector(title, options, opts),
 			confirm: (title, message, opts) => this.showExtensionConfirm(title, message, opts),
 			input: (title, placeholder, opts) => this.showExtensionInput(title, placeholder, opts),
@@ -2344,6 +2351,77 @@ export class InteractiveMode {
 			getToolsExpanded: () => this.toolOutputExpanded,
 			setToolsExpanded: (expanded) => this.setToolsExpanded(expanded),
 		};
+	}
+
+	private showAgentActivity(activity: AgentActivity): void {
+		const identity = JSON.stringify([activity.role, activity.runId, activity.attemptId, activity.runtimeId]);
+		const event = activity.event;
+		if (event.type === "start") {
+			if (this.activeAgentActivity && this.activeAgentActivity !== identity) return;
+			this.activeAgentActivity = identity;
+			this.showWorkingStatusIndicator();
+		} else if (this.activeAgentActivity !== identity) {
+			return;
+		} else if (event.type === "end") {
+			for (const component of this.agentActivityTools.values()) {
+				component.updateResult({
+					content: [{ type: "text", text: "Activity ended before this tool returned." }],
+					isError: true,
+				});
+			}
+			this.agentActivityTools.clear();
+			this.activeAgentActivity = undefined;
+			if (this.session.isStreaming && this.workingVisible) this.showWorkingStatusIndicator();
+			else this.clearStatusIndicator("working");
+		} else {
+			const id = `${identity}:${event.toolCallId}`;
+			if (event.type === "tool_execution_start") {
+				if (this.agentActivityTools.has(id)) return;
+				const component = new ToolExecutionComponent(
+					`${activity.role} · ${activity.tool?.label ?? event.toolName}`,
+					id,
+					event.args,
+					{
+						showImages: this.settingsManager.getShowImages(),
+						imageWidthCells: this.settingsManager.getImageWidthCells(),
+					},
+					{
+						...activity.tool,
+						renderCall: (args: unknown, theme: Theme, context: ToolRenderContext) => {
+							const title = new Text(
+								theme.fg(
+									"toolTitle",
+									theme.bold(`${activity.role} · ${activity.tool?.label ?? event.toolName}`),
+								),
+								0,
+								0,
+							);
+							const call = activity.tool?.renderCall?.(args, theme, context);
+							const container = new Container();
+							container.addChild(title);
+							container.addChild(call ?? new Text(JSON.stringify(args, null, 2), 0, 0));
+							return container;
+						},
+					},
+					this.ui,
+					this.sessionManager.getCwd(),
+				);
+				component.setExpanded(this.toolOutputExpanded);
+				component.setArgsComplete();
+				component.markExecutionStarted();
+				this.chatContainer.addChild(component);
+				this.agentActivityTools.set(id, component);
+			} else {
+				const component = this.agentActivityTools.get(id);
+				if (event.type === "tool_execution_update")
+					component?.updateResult({ ...event.partialResult, isError: false }, true);
+				else {
+					component?.updateResult({ ...event.result, isError: event.isError });
+					this.agentActivityTools.delete(id);
+				}
+			}
+		}
+		this.ui.requestRender();
 	}
 
 	/**
@@ -3220,7 +3298,7 @@ export class InteractiveMode {
 				if (this.settingsManager.getShowTerminalProgress()) {
 					this.ui.terminal.setProgress(false);
 				}
-				this.clearStatusIndicator("working");
+				if (!this.activeAgentActivity) this.clearStatusIndicator("working");
 				if (this.streamingComponent) {
 					this.chatContainer.removeChild(this.streamingComponent);
 					this.streamingComponent = undefined;

@@ -33,10 +33,13 @@ function runDoctor(fillManagedBinary) {
 	}
 }
 
-// A tool installed only in the agent bin directory must not be reported as
-// missing. node is the one executable every host running this test has.
+// A copied Node executable can depend on libraries relative to its install path.
+// POSIX uses a self-contained executable fixture; Windows keeps the native binary.
 test("finds rg and fd in the agent bin directory when they are not on PATH", () => {
-	const { binDir, lines } = runDoctor((path) => copyFileSync(process.execPath, path));
+	const { binDir, lines } = runDoctor((path) => {
+		if (process.platform === "win32") copyFileSync(process.execPath, path);
+		else writeFileSync(path, '#!/bin/sh\nprintf "fixture tool 1.0\\n"\n', { mode: 0o755 });
+	});
 	for (const label of ["rg", "fd"]) {
 		const line = lines.find((candidate) => candidate.includes(` ${label}: `));
 		assert.ok(line?.startsWith("PASS "), `expected a PASS line for ${label}, got: ${line}`);

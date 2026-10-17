@@ -118,7 +118,7 @@ export class SureCoordinator {
 	}
 
 	invalidateRepair(reason: string): void {
-		const task = this.state.repairs?.find((repair) => repair.id === this.state.pendingRepair?.id);
+		const task = [...(this.state.repairs ?? [])].reverse().find((repair) => repair.unitId === this.state.unitId);
 		if (task) task.stopReason = reason;
 		this.state.pendingRepair = undefined;
 	}
@@ -223,7 +223,11 @@ export class SureCoordinator {
 			this.state.unresolvedCheckVersion = undefined;
 			this.state.lastSuccessSnapshot = snapshot.id;
 			this.state.lastSuccessUnit = check.unitId;
-			if (task) task.remainingBlocker = undefined;
+			if (task) {
+				task.remainingBlocker = undefined;
+				// A still-pending task survived shutdown; passing its gate is not invalidation.
+				task.stopReason = undefined;
+			}
 			this.state.pendingRepair = undefined;
 		} else if (
 			returned &&

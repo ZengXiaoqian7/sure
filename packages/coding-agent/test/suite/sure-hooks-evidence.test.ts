@@ -72,6 +72,7 @@ it.each([true, false])(
 		if (!enabled) {
 			expect(existsSync(recordsDir)).toBe(false);
 			expect(gate.checks).toBeUndefined();
+			expect(gate.statePatchHookId).toBeUndefined();
 			return;
 		}
 		expect(gate.checks?.map((check) => check.checker)).toEqual(["first", "business-blocker", "hooks.ts"]);
@@ -92,3 +93,63 @@ it.each([true, false])(
 			});
 	},
 );
+
+it.each([
+	{ handlers: ["first", "last"], selected: "last", index: 1, ok: true },
+	{ handlers: ["first", "rejectPatch", "last"], selected: "rejectPatch", index: 1, ok: false },
+	{ handlers: ["first", "reject", "last"], selected: "first", index: 0, ok: false },
+	{ handlers: ["reject"], selected: undefined, index: undefined, ok: false },
+])("retains the selected patch's source for $handlers", async ({ handlers, selected, index, ok }) => {
+	const harness = await createHarness();
+	harnesses.push(harness);
+	const dir = join(harness.tempDir, ".sure/skills/demo");
+	mkdirSync(dir, { recursive: true });
+	for (const name of ["SKILL.md", "common.md", "stage.md"]) writeFileSync(join(dir, name), "Fixture contract");
+	writeFileSync(
+		join(dir, "hooks.ts"),
+		`
+const patch = name => ({checkpoint:{id:name}});
+export const first=()=>({ok:true,state_patch:patch("first")});
+export const last=()=>({ok:true,state_patch:patch("last")});
+export const rejectPatch=()=>({ok:false,state_patch:patch("rejectPatch")});
+export const reject=()=>({ok:false});
+`,
+	);
+	writeFileSync(
+		join(dir, "sure.skill.json"),
+		JSON.stringify({
+			name: "demo",
+			command: "sure_feed",
+			prompt: "SKILL.md",
+			coordination: {
+				version: 1,
+				commonPrompt: "common.md",
+				stages: [{ id: "stage", prompt: "stage.md", references: [], snapshotPaths: [] }],
+			},
+			hooks: { post_tool_result: handlers.map((handler) => ({ module: "hooks.ts", handler })) },
+		}),
+	);
+	const skill = discoverSureSkillPackages(harness.tempDir).packages[0];
+	const run = new SureRunManager(harness.tempDir).createRun(skill, "");
+	const gate = await new SureHookRunner(skill).run("post_tool_result", {
+		run,
+		skill: skill.manifest,
+		cwd: run.cwd,
+		packageDir: dir,
+		runDir: run.runDir,
+		args: "",
+	});
+	expect(gate.ok).toBe(ok);
+	expect(gate.state_patch).toEqual(selected ? { checkpoint: { id: selected } } : undefined);
+	if (index === undefined) expect(gate.statePatchHookId).toBeUndefined();
+	else {
+		const record = JSON.parse(
+			readFileSync(join(run.runDir, "evidence/hooks", `${gate.statePatchHookId}.json`), "utf8"),
+		);
+		expect(record).toMatchObject({ index, handler: selected, result: { state_patch: gate.state_patch } });
+	}
+	const records = readdirSync(join(run.runDir, "evidence/hooks")).map((name) =>
+		JSON.parse(readFileSync(join(run.runDir, "evidence/hooks", name), "utf8")),
+	);
+	if (!ok && handlers.length > 2) expect(records.find((record) => record.index === 2).status).toBe("not_executed");
+});

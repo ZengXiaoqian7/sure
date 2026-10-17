@@ -3,11 +3,15 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 import { buildInvocationPrompt } from "../../src/core/sure/extension.ts";
 import { NFS_ROOT, resolveOutputDir, stripOutputDir } from "../../src/core/sure/output-dir.ts";
 import { SureRunManager } from "../../src/core/sure/run-manager.ts";
 import type { SureRunRecord, SureSkillPackage } from "../../src/core/sure/types.ts";
+
+afterAll(() => {
+	rmSync(resolve(__dirname, "tmp-run-output-dir"), { recursive: true, force: true });
+});
 
 function freshRoot(name: string): string {
 	const root = resolve(__dirname, "tmp-run-output-dir", name);

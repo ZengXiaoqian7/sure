@@ -17,6 +17,7 @@ import type {
 } from "./coordination-types.ts";
 import type { SureCoordinator } from "./coordinator.ts";
 import {
+	loadSureCheckpointTimeline,
 	loadSureDiagnosticIndex,
 	packSureDiffIndex,
 	pageSureDiagnosticValue,
@@ -390,6 +391,7 @@ export async function diagnoseSureRun(
 				state.yieldReason === state.lastFailure?.summary ? { sameAs: "lastFailure.summary" } : state.yieldReason,
 			repairScope: visibleRepairScope,
 			stages: index.stages,
+			checkpointTimeline: loadSureCheckpointTimeline(coordinator.run, index),
 			checkIndex: {
 				count: index.checks.length,
 				operation: "checks",
@@ -996,6 +998,7 @@ export async function diagnoseSureRun(
 		accountedUsage = currentUsage ?? createUsageTotals();
 		update();
 		const investigationGuide = [
+			"checkpointTimeline shows recorded applied checkpoint changes, not inferred tool progress or a replayable filesystem. Field values are short previews; use log with logOffset/previousLogOffset for complete recorded states, hooks with hookId for the selected patch source, and check with checkVersion for its observed snapshot. Null links and unreadableOffsets are unknown; never infer causality from nearby timestamps. Snapshot coverage does not guarantee all artifacts from that point were retained, and live files are not historical versions.",
 			"Investigate one complete current condition, not one task per object. Read global instructions, current task, user constraints and actual actions together. Preserve executor autonomy and necessary installation/runtime objects; focusPaths are hints, never a new write allowlist. Work-volume and repair counts are observations, not new business retry caps.",
 			"The original business checks remain authoritative. Evidence scope is not a prerequisite list: inputPaths/snapshotPaths describe inspection coverage, not required inputs. A guessed read path and its ENOENT do not establish a required artifact or producer. A successful tool result is not a passed gate; a historical pass does not prove current file presence. not_captured or truncated coverage is unknown, not missing.",
 			"The initial navigation covers every stage and action identity, current failure and correction records. Use actions/checks/hooks/repairs for details and file/search/list to inspect relevant project or runtime sources, including absolute paths. Runtime dependency source text is readable; secrets, weights and binary payloads are excluded. No shell or process execution is available. If a real probe is needed, include it with the resulting corrective steps and original validation in one complete guidance task. Do not ask the executor to collect results and return for approval.",

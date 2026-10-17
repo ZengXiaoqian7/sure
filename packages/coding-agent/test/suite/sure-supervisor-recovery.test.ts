@@ -4,10 +4,6 @@ import { type FauxResponseStep, fauxAssistantMessage, fauxToolCall } from "@eare
 import { Compile } from "typebox/compile";
 import { afterEach, describe, expect, it } from "vitest";
 import type { AgentSession } from "../../src/core/agent-session.ts";
-import { createIsolatedResourceLoader } from "../../src/core/isolated-resource-loader.ts";
-import { createAgentSession } from "../../src/core/sdk.ts";
-import { SessionManager } from "../../src/core/session-manager.ts";
-import { SettingsManager } from "../../src/core/settings-manager.ts";
 import { captureSureExecutorProgress } from "../../src/core/sure/context.ts";
 import { parseSureDiagnosisResult } from "../../src/core/sure/coordination-contracts.ts";
 import type {
@@ -21,7 +17,7 @@ import { buildSureFailureReport, renderSureFailureReport } from "../../src/core/
 import { diagnoseSureRun } from "../../src/core/sure/supervisor.ts";
 import type { SureRunRecord } from "../../src/core/sure/types.ts";
 import { createHarness, getMessageText, type Harness } from "./harness.ts";
-import { pauseDiagnosis, repairHandoff } from "./sure-control-fixtures.ts";
+import { fixtureExecutor, pauseDiagnosis, repairHandoff } from "./sure-control-fixtures.ts";
 
 function checkpointReason(outcome: SureDiagnosisOutcome): string {
 	expect(outcome.decision).toBe("checkpoint");
@@ -41,16 +37,7 @@ const stage = {
 async function setup(helperText = "Read declared options and produce the requested report.\n") {
 	const harness = await createHarness();
 	harnesses.push(harness);
-	const { session } = await createAgentSession({
-		cwd: harness.tempDir,
-		agentDir: harness.tempDir,
-		model: harness.getModel(),
-		modelRuntime: harness.session.modelRuntime,
-		sessionManager: SessionManager.inMemory(harness.tempDir),
-		settingsManager: SettingsManager.inMemory({ compaction: { enabled: false } }),
-		resourceLoader: createIsolatedResourceLoader("Executor"),
-		tools: [],
-	});
+	const { session } = await fixtureExecutor(harness, "Executor");
 	sessions.push(session);
 	await session.bindExtensions({});
 	const runDir = join(harness.tempDir, ".sure/runs/report-recovery");

@@ -1,8 +1,9 @@
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, expect, it } from "vitest";
 import { SureCoordinator } from "../../src/core/sure/coordinator.ts";
 import {
+	loadSureCheckpointTimeline,
 	loadSureDiagnosticIndex,
 	packSureDiffIndex,
 	pageSureDiagnosticValue,
@@ -10,10 +11,57 @@ import {
 	sureSnapshotForPath,
 } from "../../src/core/sure/diagnostic-view.ts";
 import { captureSureSnapshot, diffSureSnapshots } from "../../src/core/sure/evidence.ts";
+import { SureRunManager } from "../../src/core/sure/run-manager.ts";
 import type { SureRunRecord } from "../../src/core/sure/types.ts";
 import { createHarness, type Harness } from "./harness.ts";
 
 const harnesses: Harness[] = [];
+
+it("derives shallow checkpoint changes from applied states and preserves exact log offsets after reload", async () => {
+	const coordinator = await setup();
+	const { run } = coordinator;
+	const manager = new SureRunManager(run.cwd);
+	const log = join(run.runDir, "events.jsonl");
+	writeFileSync(log, `${JSON.stringify({ type: "note", data: "中文🌍" })}\n`);
+	const checkpoint = { id: "custom", data: { position: "prepare", attempts: { prepare: 0 }, memo: "x".repeat(700) } };
+	manager.updateState(run, { checkpoint });
+	manager.updateState(run, { message: "display only" });
+	manager.updateState(run, {
+		checkpoint: { id: "custom", data: { memo: checkpoint.data.memo, attempts: { prepare: 0 }, position: "prepare" } },
+	});
+	manager.updateState(run, {
+		checkpoint: { id: "custom", data: { ...checkpoint.data, position: "execute", attempts: { prepare: 1 } } },
+	});
+	const index = loadSureDiagnosticIndex(coordinator);
+	const timeline = loadSureCheckpointTimeline(run, index);
+	expect(timeline.transitions).toHaveLength(2);
+	expect(timeline.transitions[0].changes.find((change) => change.field.join(".") === "data.memo")?.after).toContain(
+		"[truncated; see log]",
+	);
+	expect(timeline.transitions[1].changes).toHaveLength(2);
+	expect(timeline.transitions[1].changes).toEqual(
+		expect.arrayContaining([
+			{ field: ["data", "position"], before: '"prepare"', after: '"execute"' },
+			{ field: ["data", "attempts"], before: '{"prepare":0}', after: '{"prepare":1}' },
+		]),
+	);
+	expect(timeline.transitions[1]).toMatchObject({ hookId: null, checkVersion: null, snapshotId: null });
+	const text = readFileSync(log, "utf8");
+	const entry = JSON.parse(pageSureDiagnosticValue(text, timeline.transitions[1].logOffset).text.split("\n")[0]);
+	expect(entry.data.state.checkpoint.data.position).toBe("execute");
+	expect(
+		JSON.parse(text.slice(timeline.transitions[1].previousLogOffset!).split("\n")[0]).data.state.checkpoint.data
+			.position,
+	).toBe("prepare");
+	const restored = new SureCoordinator(run, "stage", []);
+	expect(loadSureCheckpointTimeline(run, loadSureDiagnosticIndex(restored))).toEqual(timeline);
+	appendFileSync(log, '{"interrupted":\n');
+	manager.updateState(run, { checkpoint: { id: "custom", data: { position: "recover" } } });
+	const afterGap = loadSureCheckpointTimeline(run, index);
+	expect(afterGap.unreadableOffsets).toEqual([text.length]);
+	expect(afterGap.transitions.at(-1)?.previousLogOffset).toBeNull();
+	expect(afterGap.transitions.at(-1)?.changes.every((change) => change.before === "[not recorded]")).toBe(true);
+});
 it.each([
 	{ name: "Unicode lines", text: "行🌍\n".repeat(5001) },
 	{ name: "single long line", text: "中🌍".repeat(50_000) },
@@ -54,6 +102,32 @@ async function setup() {
 	mkdirSync(join(run.runDir, "artifacts"), { recursive: true });
 	return new SureCoordinator(run, "stage", ["run:artifacts"]);
 }
+it("ignores interrupted hook writes without hiding corrupt published records", async () => {
+	const coordinator = await setup();
+	const hooks = join(coordinator.run.runDir, "evidence/hooks");
+	mkdirSync(hooks, { recursive: true });
+	const record = {
+		id: "invocation-0",
+		invocationId: "invocation",
+		invocationAttempt: 1,
+		index: 0,
+		point: "post_tool_result",
+		module: "hooks.ts",
+		handler: "check",
+		status: "completed",
+		startedAt: "2026-10-17T00:00:00Z",
+		finishedAt: "2026-10-17T00:00:00Z",
+		result: { ok: true },
+	};
+	writeFileSync(join(hooks, "invocation-0.json"), JSON.stringify(record));
+	const before = loadSureDiagnosticIndex(coordinator);
+	expect(before.hooks).toEqual([record]);
+	writeFileSync(join(hooks, "invocation-0.json.interrupted.tmp"), '{"id":');
+	writeFileSync(join(hooks, "invocation-1.json.unpublished.tmp"), JSON.stringify(record));
+	expect(loadSureDiagnosticIndex(new SureCoordinator(coordinator.run, "stage", []))).toEqual(before);
+	writeFileSync(join(hooks, "corrupt.json"), '{"id":');
+	expect(() => loadSureDiagnosticIndex(coordinator)).toThrow(SyntaxError);
+});
 it("indexes every stage and check beyond the former 1024-record cutoff", async () => {
 	const coordinator = await setup();
 	const evidence = join(coordinator.run.runDir, "evidence");

@@ -13,23 +13,15 @@ import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/compat
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentSession } from "../../src/core/agent-session.ts";
 import type { AgentActivity } from "../../src/core/extensions/types.ts";
-import { createIsolatedResourceLoader } from "../../src/core/isolated-resource-loader.ts";
-import { createAgentSession } from "../../src/core/sdk.ts";
 import type { IsolatedSession, IsolatedSessionRequest } from "../../src/core/session-controls.ts";
-import { SessionManager } from "../../src/core/session-manager.ts";
-import { SettingsManager } from "../../src/core/settings-manager.ts";
-import type {
-	SureCoordinationLimits,
-	SureDiagnosisOutcome,
-	SureDiagnosisResult,
-} from "../../src/core/sure/coordination-types.ts";
+import type { SureDiagnosisOutcome, SureDiagnosisResult } from "../../src/core/sure/coordination-types.ts";
 import { SureCoordinator } from "../../src/core/sure/coordinator.ts";
 import { writeSureJson } from "../../src/core/sure/evidence.ts";
 import { diagnoseSureRun } from "../../src/core/sure/supervisor.ts";
 import type { SureRunRecord, SureSkillPackage } from "../../src/core/sure/types.ts";
 import { readSureUserContext, syncSureUserContext } from "../../src/core/sure/user-context.ts";
 import { createHarness, type Harness } from "./harness.ts";
-import { pauseDiagnosis, repairHandoff } from "./sure-control-fixtures.ts";
+import { fixtureExecutor, pauseDiagnosis, repairHandoff } from "./sure-control-fixtures.ts";
 
 function checkpointReason(outcome: SureDiagnosisOutcome): string {
 	expect(outcome.decision).toBe("checkpoint");
@@ -42,19 +34,10 @@ const sessions: AgentSession[] = [];
 const externalSources: string[] = [];
 const stage = { id: "build_env", prompt: "stage.md", references: [], snapshotPaths: ["run:artifacts"] };
 
-async function setup(budgets: Partial<SureCoordinationLimits> = {}) {
+async function setup() {
 	const harness = await createHarness();
 	harnesses.push(harness);
-	const { session } = await createAgentSession({
-		cwd: harness.tempDir,
-		agentDir: harness.tempDir,
-		model: harness.getModel(),
-		modelRuntime: harness.session.modelRuntime,
-		sessionManager: SessionManager.inMemory(harness.tempDir),
-		settingsManager: SettingsManager.inMemory({ compaction: { enabled: false } }),
-		resourceLoader: createIsolatedResourceLoader("Parent executor"),
-		tools: [],
-	});
+	const { session } = await fixtureExecutor(harness, "Parent executor");
 	sessions.push(session);
 	await session.bindExtensions({});
 	const runDir = join(harness.tempDir, ".sure/runs/test-run");
@@ -75,7 +58,7 @@ async function setup(budgets: Partial<SureCoordinationLimits> = {}) {
 		join(run.packageDir, "stage.md"),
 		"Prepare the declared model environment and rerun its original check.",
 	);
-	const coordinator = new SureCoordinator(run, "build_env", ["run:artifacts", "package:stage.md"], budgets);
+	const coordinator = new SureCoordinator(run, "build_env", ["run:artifacts", "package:stage.md"]);
 	coordinator.observe(
 		{
 			unitId: "build_env",

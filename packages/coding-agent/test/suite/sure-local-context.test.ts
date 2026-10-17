@@ -30,6 +30,7 @@ const run: SureRunRecord = {
 	startedAt: "now",
 	updatedAt: "now",
 };
+// Frozen c7806d5 business contract; e3e9445 is the PR diff base, not this instruction baseline.
 const baseline = readFileSync(new URL("../fixtures/sure/onboard-baseline-skill.md", import.meta.url), "utf8");
 const clauses = new Map([...baseline.matchAll(/^- \*\*([^*]+)\*\*: (.+)$/gm)].map((match) => [match[1], match[2]]));
 const sharedSections = [
@@ -44,6 +45,15 @@ const sharedSections = [
 ].map(([start, end]) => baseline.slice(baseline.indexOf(start), baseline.indexOf(end)).trim());
 
 describe("baseline-equivalent local instructions", () => {
+	it("keeps original consumer sources available for failure-specific read-only diagnosis", () => {
+		for (const unit of ["generate_wrapper", "validate_contract", "finalize_model_bundle"]) {
+			const stage = skill.manifest.coordination!.stages.find((stage) => stage.id === unit)!;
+			expect(stage.diagnosticPaths).toContain("project:sure/skills/sure_infer/scripts/server_protocol.py");
+			expect(stage.diagnosticPaths).toContain(
+				"project:sure/skills/sure_infer/scripts/generate_predictions_via_server.py",
+			);
+		}
+	});
 	it("keeps the complete supervisor manual free of an added routine service checklist", () => {
 		const currentClauses = [...skill.prompt.matchAll(/^- \*\*([^*]+)\*\*: (.+)$/gm)].map((match) => [
 			match[1],

@@ -70,8 +70,9 @@ export function syncSureUserContext(coordinator: SureCoordinator, messages: Agen
 	if (!changed) return;
 	coordinator.state.evidenceVersion++;
 	coordinator.state.reviewedFailureVersion = undefined;
-	if (coordinator.state.pendingRepair || coordinator.state.unresolvedCheckVersion !== undefined) {
-		coordinator.invalidateRepair("User instructions changed.");
+	const reconsider = coordinator.state.pendingRepair || coordinator.state.unresolvedCheckVersion !== undefined;
+	coordinator.invalidateRepair("User instructions changed.");
+	if (reconsider) {
 		if (coordinator.state.status === "executing") coordinator.state.status = "yielding";
 		coordinator.state.yieldReason = "User instructions changed; the previous repair must be reconsidered.";
 	}

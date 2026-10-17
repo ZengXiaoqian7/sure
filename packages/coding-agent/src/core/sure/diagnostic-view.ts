@@ -1,10 +1,92 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "../tools/truncate.ts";
 import type { SureCheckEvidence, SureToolObservation } from "./coordination-types.ts";
 import type { SureCoordinator } from "./coordinator.ts";
 import { readSureSnapshot, type SureSnapshot } from "./evidence.ts";
 import type { SureHookExecution } from "./hooks.ts";
+import type { SureRunRecord } from "./types.ts";
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/** Read-time view of applied checkpoints; log offsets use the diagnostic tool's character units. */
+export function loadSureCheckpointTimeline(run: SureRunRecord, index: ReturnType<typeof loadSureDiagnosticIndex>) {
+	const path = join(run.runDir, "events.jsonl");
+	const hooks = new Map(index.hooks.map((hook) => [hook.id, hook]));
+	const checks = new Map(
+		index.checks.flatMap((record) => (record.check.checkId ? [[record.check.checkId, record]] : [])),
+	);
+	const transitions: {
+		logOffset: number;
+		previousLogOffset: number | null;
+		type: unknown;
+		timestamp: unknown;
+		hookId: string | null;
+		checkVersion: number | null;
+		snapshotId: string | null;
+		changes: { field: string[]; before: string; after: string }[];
+	}[] = [];
+	const unreadableOffsets: number[] = [];
+	if (!existsSync(path)) return { source: "run:events.jsonl", available: false, transitions, unreadableOffsets };
+	let previous: Record<string, unknown> | undefined;
+	let previousLogOffset: number | null = null;
+	let offset = 0;
+	const compact = (value: unknown): string => {
+		const text = JSON.stringify(value) ?? "[not recorded]";
+		return text.length > 160 ? `${text.slice(0, 160)} [truncated; see log]` : text;
+	};
+	for (const line of readFileSync(path, "utf8").split("\n")) {
+		const logOffset = offset;
+		offset += line.length + 1;
+		if (!line.trim()) continue;
+		let event: unknown;
+		try {
+			event = JSON.parse(line);
+			if (!isRecord(event)) throw new Error("Invalid event.");
+		} catch {
+			unreadableOffsets.push(logOffset);
+			previous = undefined;
+			previousLogOffset = null;
+			continue;
+		}
+		if (!isRecord(event) || !isRecord(event.data) || !isRecord(event.data.state)) continue;
+		const checkpoint = event.data.state.checkpoint;
+		if (!isRecord(checkpoint)) continue;
+		const changes: (typeof transitions)[number]["changes"] = [];
+		for (const key of new Set([...Object.keys(previous ?? {}), ...Object.keys(checkpoint)])) {
+			const before = previous?.[key];
+			const after = checkpoint[key];
+			// Shallow data fields keep the mainline useful without interpreting a skill's state machine.
+			if (key === "data" && (before === undefined || isRecord(before)) && isRecord(after)) {
+				for (const field of new Set([...Object.keys(before ?? {}), ...Object.keys(after)]))
+					if (!isDeepStrictEqual(before?.[field], after[field]))
+						changes.push({ field: [key, field], before: compact(before?.[field]), after: compact(after[field]) });
+			} else if (!isDeepStrictEqual(before, after))
+				changes.push({ field: [key], before: compact(before), after: compact(after) });
+		}
+		if (changes.length) {
+			const hookId = typeof event.data.hookExecutionId === "string" ? event.data.hookExecutionId : null;
+			const checkId = hookId ? hooks.get(hookId)?.result?.check?.checkId : undefined;
+			const check = checkId ? checks.get(checkId) : undefined;
+			transitions.push({
+				logOffset,
+				previousLogOffset,
+				type: event.type,
+				timestamp: event.timestamp,
+				hookId,
+				checkVersion: check?.version ?? null,
+				snapshotId: check?.snapshotId ?? null,
+				changes,
+			});
+		}
+		previous = checkpoint;
+		previousLogOffset = logOffset;
+	}
+	return { source: "run:events.jsonl", available: true, transitions, unreadableOffsets };
+}
 
 export interface SureCheckRecord {
 	check: SureCheckEvidence;
@@ -184,6 +266,7 @@ export function loadSureDiagnosticIndex(coordinator: SureCoordinator) {
 	const hooksDir = join(evidenceDir, "hooks");
 	const hooks = existsSync(hooksDir)
 		? readdirSync(hooksDir)
+				.filter((name) => name.endsWith(".json"))
 				.map((name) => JSON.parse(readFileSync(join(hooksDir, name), "utf8")) as SureHookExecution)
 				.sort(
 					(a, b) =>

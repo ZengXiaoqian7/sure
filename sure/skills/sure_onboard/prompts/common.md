@@ -146,9 +146,9 @@ Earlier runs leave agent-written notes. `sure/memory/index.md` (repo root) is th
 
 ## Diagnosis and retry
 
-On gate failure, retain the actual failure in validation.log / build.log and use DIAGNOSE → REPLAN. Classify with references/playbooks/failure_taxonomy.md and consult references/policies/retry_and_escalation.md. The original hook owns retry accounting, including the run's max_retries and special extraction rule; reads, tool errors and supervisor handoffs do not consume additional gate retries. A handoff threshold requests evaluation, not an earlier business failure.
+On gate failure, retain the actual failure in validation.log / build.log and use DIAGNOSE → REPLAN. Classify with references/playbooks/failure_taxonomy.md and consult references/policies/retry_and_escalation.md. The original hook owns retry accounting, including the run's max_retries and special extraction rule; reads, tool errors and supervisor handoffs do not consume additional gate retries.
 
-The default max_retries is 3; preserve the run's explicit override and the hook's actual exhausted result. Repeated blocks require checking the model_input_path or repo link, access permissions, and whether the documentation provides enough install/load/inference/artifact information. Hand the unresolved blocker and existing attempts to the supervisor for assessment; do not keep changing artifacts merely to bypass a hook. Do not treat coordination counts as additional business limits.
+The default max_retries is 3; preserve the run's explicit override and the hook's actual exhausted result. Repeated blocks require checking the model_input_path or repo link, access permissions, and whether the documentation provides enough install/load/inference/artifact information. The harness automatically schedules supervisor investigation from actual failures and rejections; wait for guidance when it yields. Do not keep changing artifacts merely to bypass a hook. Do not treat coordination counts as additional business limits.
 
 `extract_lessons` is the one unit that never ends FAILED: after two consecutive gate failures (`max_retries=` can raise that number, never lower it) the hook advances on its own and records `extraction: failed`.
 

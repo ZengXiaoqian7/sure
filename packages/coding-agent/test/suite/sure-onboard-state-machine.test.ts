@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 import {
 	advance,
 	bumpRetry,
@@ -27,6 +27,11 @@ import type { SureHookContext } from "../../src/core/sure/types.ts";
 
 // sure_onboard skill package root (repo-relative from the test file).
 const PACKAGE_DIR = resolve(__dirname, "../../../../sure/skills/sure_onboard");
+
+afterAll(() => {
+	rmSync(resolve(__dirname, "tmp-ob"), { recursive: true, force: true });
+	rmSync(resolve(__dirname, "tmp-ob-prestart"), { recursive: true, force: true });
+});
 
 type StatePatchForTest = {
 	message?: string;

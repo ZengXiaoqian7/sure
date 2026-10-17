@@ -13,7 +13,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { basename, join, resolve } from "node:path";
-import { beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { resolveHarnessPython } from "../../../../sure/runtime/harness/resolve.ts";
 // Imported as a namespace (not a named import) so vi.spyOn can override just
 // memoryConfigOrUndefined for one test, the same way sure-extension.test.ts spies on
@@ -46,6 +46,11 @@ import type { SureHookContext } from "../../src/core/sure/types.ts";
 const REPO_ROOT = resolve(__dirname, "../../../..");
 const REAL_PACKAGE_DIR = join(REPO_ROOT, "sure", "skills", "sure_onboard");
 const TMP = resolve(__dirname, "tmp-ob-memory");
+
+afterAll(() => {
+	rmSync(TMP, { recursive: true, force: true });
+});
+
 const CONFIG = loadMemoryConfig();
 const HARNESS = resolveHarnessPython(REAL_PACKAGE_DIR);
 

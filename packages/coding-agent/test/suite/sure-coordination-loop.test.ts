@@ -71,6 +71,7 @@ async function setup(
 		delayGate?: boolean;
 		delayFinish?: boolean;
 		preflightReject?: boolean;
+		preflightCheck?: "pending" | "passed";
 		duringDiagnosis?: (harness: Harness) => void | Promise<void>;
 		onTimeline?: (timeline: string) => void;
 		onDiagnosisPrompt?: (prompt: string) => void;
@@ -208,7 +209,7 @@ import { join } from "node:path";
 export function resolved(ctx) { writeFileSync(join(ctx.runDir,"artifacts/request.json"),"{}"); return {ok:true,check:{unitId:"resolve",outcome:"passed",summary:"Fixture request resolved",inputPaths:[],artifactPaths:["run:artifacts/request.json"]}}; }
 export function selected(ctx) { writeFileSync(join(ctx.runDir,"artifacts/context.json"),"{}"); return {ok:true,check:{unitId:"context",outcome:"passed",summary:"Fixture context selected",inputPaths:[],artifactPaths:["run:artifacts/context.json"]}}; }
 export function preStart() { return { ok:true, state_patch:{ phase:{id:"stage",status:"running"}, checkpoint:{resumable:true,data:{currentUnit:"stage",completedUnits:[]}} } }; }
-export function preflight(ctx) { return ctx.event.input.value?.startsWith("reject") ? {ok:false,repair:"Correct the rejected value."} : {ok:true}; }
+export function preflight(ctx) { return ctx.event.input.value?.startsWith("reject") ? {ok:false,repair:"Correct the rejected value."} : {ok:true${options.preflightCheck ? `,check:{unitId:"stage",outcome:"${options.preflightCheck}",summary:"Preflight allowed the call",inputPaths:[],artifactPaths:[]}` : ""}}; }
 export async function postToolResult(ctx) {
  ${options.delayGate ? 'writeFileSync(join(ctx.runDir,"gate-started"),"started"); await new Promise(resolve=>setTimeout(resolve,50));' : ""}
  if(ctx.event.isError) return {ok:true,check:{unitId:"stage",outcome:"blocked",failureKind:"tool",summary:"Execution tool failed",repair:"Inspect and correct the call.",artifactPaths:["run:artifacts/current.json"],inputPaths:[]}};
@@ -252,7 +253,9 @@ export function complexSubcheck() {
 			})),
 		},
 		hooks: {
-			...(options.preflightReject ? { pre_tool_call: [{ module: "hooks.ts", handler: "preflight" }] } : {}),
+			...(options.preflightReject || options.preflightCheck
+				? { pre_tool_call: [{ module: "hooks.ts", handler: "preflight" }] }
+				: {}),
 			pre_start: [...(options.priorStages ? ["resolved", "selected"] : []), "preStart"].map((handler) => ({
 				module: "hooks.ts",
 				handler,
@@ -327,6 +330,66 @@ function seedInterruptedRun(harness: Harness, failureKind: "semantic" | "tool" =
 }
 
 describe("Sure executor/supervisor handoff", () => {
+	it.each(["pending", "passed"] as const)(
+		"runs the original post hook after a %s preflight check and ignores duplicate results while executing",
+		async (preflightCheck) => {
+			const fixture = await setup({ preflightCheck });
+			fixture.harness.setResponses([
+				fauxAssistantMessage([fauxToolCall("work", { value: "format" }, { id: "allowed-call" })], {
+					stopReason: "toolUse",
+				}),
+				async (context) => {
+					const before = state(fixture.harness);
+					expect(before.status).toBe("executing");
+					expect(before.lastCheck).toMatchObject({ outcome: "blocked", summary: "Gate saw format" });
+					expect(
+						context.messages
+							.filter((message) => message.role === "toolResult")
+							.map(getMessageText)
+							.join("\n"),
+					).toContain("SURE gate feedback: Fix the required field.");
+					const run = JSON.parse(readFileSync(join(runDir(fixture.harness), "run.json"), "utf8"));
+					const manager = new SureRunManager(fixture.harness.tempDir);
+					expect(manager.readState(run)?.phase?.status).toBe("blocked");
+					const directory = join(runDir(fixture.harness), "evidence/hooks");
+					const hooks = readdirSync(directory);
+					expect(
+						hooks
+							.map((name) => JSON.parse(readFileSync(join(directory, name), "utf8")))
+							.filter((hook) => hook.toolCallId === "allowed-call")
+							.map((hook) => hook.point)
+							.sort(),
+					).toEqual(["post_tool_result", "pre_tool_call"]);
+					expect(
+						Object.keys(before.observedToolChecks ?? {})
+							.map((key) => JSON.parse(key)[2])
+							.sort(),
+					).toEqual(["post_tool_result:hooks.ts:postToolResult:0", "pre_tool_call:hooks.ts:preflight:0"]);
+					const checkpoint = manager.readState(run)?.checkpoint;
+					await fixture.harness.session.extensionRunner.emitToolResult({
+						type: "tool_result",
+						toolName: "work",
+						toolCallId: "allowed-call",
+						input: { value: "good" },
+						content: [{ type: "text", text: "Duplicate result" }],
+						details: {},
+						isError: false,
+					});
+					expect(state(fixture.harness).evidenceVersion).toBe(before.evidenceVersion);
+					expect(manager.readState(run)?.checkpoint).toEqual(checkpoint);
+					expect(readdirSync(directory)).toEqual(hooks);
+					expect(fixture.executed).toEqual(["format"]);
+					return fauxAssistantMessage([fauxToolCall("work", { value: "good" })], { stopReason: "toolUse" });
+				},
+				() => fixture.finish(),
+			]);
+			await fixture.harness.session.prompt("/sure_feed model=demo");
+			expect(fixture.executed).toEqual(["format", "good"]);
+			expect(fixture.diagnoses).toBe(0);
+			expect(state(fixture.harness).lastCheck?.outcome).toBe("passed");
+		},
+	);
+
 	it("automatically diagnoses a failed correction without an executor help signal", async () => {
 		const fixture = await setup();
 		fixture.harness.setResponses([
@@ -560,6 +623,124 @@ describe("Sure executor/supervisor handoff", () => {
 		expect(state(fixture.harness).repairs?.length ?? 0).toBe(1);
 		expect(state(fixture.harness).repairs!.filter((repair) => repair.id === id)).toHaveLength(1);
 		expect(fixture.diagnoses).toBe(0);
+	});
+
+	it.each([false, true])(
+		"does not restore invalidated repair text or fall back after gatePassed=%s",
+		async (gatePassed) => {
+			const fixture = await setup({ decision: "continue" });
+			const coordinator = seedInterruptedRun(fixture.harness);
+			coordinator.acceptDiagnosis({ ...result(fixture.harness), repair: "OLDER_REPAIR_BODY" });
+			const scope = [
+				"run:artifacts",
+				...surePromptPaths(discoverSureSkillPackages(fixture.harness.tempDir).packages[0], "stage"),
+			];
+			coordinator.observe(
+				{ unitId: "stage", outcome: "passed", summary: "Older gate passed", inputPaths: [], artifactPaths: [] },
+				scope,
+			);
+			coordinator.acceptDiagnosis({ ...result(fixture.harness), repair: "INVALIDATED_REPAIR_BODY" });
+			const invalidatedId = coordinator.state.pendingRepair!.id;
+			if (gatePassed)
+				coordinator.observe(
+					{
+						unitId: "stage",
+						outcome: "passed",
+						summary: "Original gate passed",
+						inputPaths: [],
+						artifactPaths: [],
+					},
+					scope,
+				);
+			const instruction = { role: "user" as const, content: "NEW_CONSTRAINT", timestamp: 1 };
+			fixture.harness.sessionManager.appendMessage(instruction);
+			syncSureUserContext(coordinator, [instruction]);
+			expect(coordinator.state.repairs?.find((repair) => repair.id === invalidatedId)?.stopReason).toBe(
+				"User instructions changed.",
+			);
+			expect(coordinator.state.status).toBe(gatePassed ? "executing" : "yielding");
+			if (!gatePassed) {
+				coordinator.beginDiagnosis();
+				const continued: SureDiagnosisResult = {
+					runId: coordinator.run.runId,
+					unitId: "stage",
+					evidenceVersion: coordinator.state.evidenceVersion,
+					decision: "continue",
+					reason: "CURRENT_CONTINUE_BODY",
+					facts: [],
+					hypotheses: [],
+					unknowns: [],
+					nextActions: [],
+					evidenceReferences: [`snapshot:${coordinator.state.latestSnapshot}`],
+				};
+				coordinator.state.attempts.at(-1)!.result = continued;
+				expect(coordinator.acceptDiagnosis(continued)).toBe(true);
+			}
+			fixture.harness.setResponses([fauxAssistantMessage("Await work on the current route.")]);
+			await fixture.harness.session.prompt(`/sure_resume ${coordinator.run.runId}`);
+			fixture.harness.settingsManager.applyOverrides({ compaction: { keepRecentTokens: 1, reserveTokens: 1000 } });
+			fixture.harness.setResponses(
+				Array.from({ length: 2 }, () => fauxAssistantMessage("Summary omits old guidance.")),
+			);
+			await fixture.harness.session.compact();
+			const views: string[] = [];
+			const check = (context: { messages: unknown[] }) => {
+				views.push(JSON.stringify(context.messages));
+				return fauxAssistantMessage("Continue with current guidance.");
+			};
+			fixture.harness.setResponses([check]);
+			await fixture.harness.session.sendUserMessage("<sure_invocation>Continue after compaction.</sure_invocation>");
+			await fixture.harness.session.extensionRunner.emit({ type: "session_shutdown", reason: "reload" });
+			fixture.harness.setResponses([check]);
+			await fixture.harness.session.prompt(`/sure_resume ${coordinator.run.runId}`);
+			expect(views).toHaveLength(2);
+			for (const view of views) {
+				expect(view).toContain("NEW_CONSTRAINT");
+				expect(view).not.toContain("INVALIDATED_REPAIR_BODY");
+				expect(view).not.toContain("OLDER_REPAIR_BODY");
+				if (!gatePassed) expect(view).toContain("CURRENT_CONTINUE_BODY");
+			}
+			expect(fixture.diagnoses).toBe(0);
+			expect(state(fixture.harness).repairs).toHaveLength(2);
+		},
+	);
+
+	it("does not restore continue guidance superseded by new constraints after the original gate passes", async () => {
+		const fixture = await setup({ decision: "continue" });
+		fixture.harness.setResponses([
+			...Array.from({ length: 2 }, () =>
+				fauxAssistantMessage([fauxToolCall("work", { value: "bad" })], { stopReason: "toolUse" }),
+			),
+			fauxAssistantMessage("Await the original gate."),
+		]);
+		await fixture.harness.session.prompt("/sure_feed model=demo");
+		fixture.harness.setResponses([
+			fauxAssistantMessage([fauxToolCall("work", { value: "good" })], { stopReason: "toolUse" }),
+			fauxAssistantMessage("Original gate passed; finish remains."),
+		]);
+		await fixture.harness.session.sendUserMessage("<sure_invocation>Run the original gate.</sure_invocation>");
+		expect(state(fixture.harness).unresolvedCheckVersion).toBeUndefined();
+		fixture.harness.setResponses([fauxAssistantMessage("Apply the new user constraint.")]);
+		await fixture.harness.session.prompt("NEW_CONSTRAINT_AFTER_CONTINUE");
+		expect(state(fixture.harness).reviewedFailureVersion).toBeUndefined();
+		fixture.harness.settingsManager.applyOverrides({ compaction: { keepRecentTokens: 1, reserveTokens: 1000 } });
+		fixture.harness.setResponses(
+			Array.from({ length: 2 }, () => fauxAssistantMessage("Summary omits old guidance.")),
+		);
+		await fixture.harness.session.compact();
+		let view = "";
+		fixture.harness.setResponses([
+			(context) => {
+				view = context.messages.map(getMessageText).join("\n");
+				return fixture.finish();
+			},
+		]);
+		await fixture.harness.session.sendUserMessage(
+			"<sure_invocation>Finish using current constraints.</sure_invocation>",
+		);
+		expect(view).toContain("NEW_CONSTRAINT_AFTER_CONTINUE");
+		expect(view).not.toContain("The existing route remains viable.");
+		expect(fixture.diagnoses).toBe(1);
 	});
 
 	it("trims obsolete bulk at compaction and then preserves the new prefix", async () => {
@@ -1585,6 +1766,39 @@ describe("Sure executor/supervisor handoff", () => {
 			expect(state(fixture.harness).pendingRepair).toBeUndefined();
 		},
 	);
+
+	it("retains a resumed shutdown goal after the original gate clears pending and compaction omits its body", async () => {
+		const fixture = await setup();
+		const coordinator = seedInterruptedRun(fixture.harness);
+		coordinator.acceptDiagnosis(result(fixture.harness));
+		const id = coordinator.state.pendingRepair!.id;
+		coordinator.stop("Session shut down before sure_finish.");
+		expect(coordinator.state.pendingRepair?.id).toBe(id);
+		fixture.harness.setResponses([
+			fauxAssistantMessage([fauxToolCall("work", { value: "good" })], { stopReason: "toolUse" }),
+			fauxAssistantMessage("Original gate passed; preserve the complete goal."),
+		]);
+		await fixture.harness.session.prompt(`/sure_resume ${coordinator.run.runId}`);
+		expect(state(fixture.harness).pendingRepair).toBeUndefined();
+		expect(state(fixture.harness).repairs?.[0].stopReason).toBeUndefined();
+		fixture.harness.settingsManager.applyOverrides({ compaction: { keepRecentTokens: 1, reserveTokens: 1000 } });
+		fixture.harness.setResponses(Array.from({ length: 2 }, () => fauxAssistantMessage("Summary omits the task.")));
+		await fixture.harness.session.compact();
+		let view = "";
+		fixture.harness.setResponses([
+			(context) => {
+				view = context.messages.map(getMessageText).join("\n");
+				return fixture.finish();
+			},
+		]);
+		await fixture.harness.session.sendUserMessage("<sure_invocation>Complete the same goal.</sure_invocation>");
+		expect(view).toContain(id);
+		expect(view).toContain("Repair the current artifact and rerun its original gate.");
+		expect(view).toContain("not a new assignment");
+		expect(fixture.diagnoses).toBe(0);
+		expect(fixture.executed).toEqual(["good"]);
+		expect(state(fixture.harness).repairs).toHaveLength(1);
+	});
 
 	it("resumes with review counters retained instead of imposing a new business cap", async () => {
 		const fixture = await setup();

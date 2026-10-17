@@ -143,10 +143,19 @@ export class SureRunManager {
 		return this.updateRun(record, { status, finishedAt }, eventType, { status });
 	}
 
-	updateState(record: SureRunRecord, patch: SureDisplayState, eventType = "state_patch"): SureDisplayState {
+	updateState(
+		record: SureRunRecord,
+		patch: SureDisplayState,
+		eventType = "state_patch",
+		hookExecutionId?: string,
+	): SureDisplayState {
 		const state = mergeSureDisplayState(this.readState(record), patch);
 		this.writeState(record, state);
-		this.appendEvent(record.runId, { type: eventType, timestamp: nowIso(), data: { patch, state } });
+		this.appendEvent(record.runId, {
+			type: eventType,
+			timestamp: nowIso(),
+			data: { patch, state, ...(hookExecutionId ? { hookExecutionId } : {}) },
+		});
 		return state;
 	}
 

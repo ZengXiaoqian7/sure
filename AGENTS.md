@@ -121,6 +121,7 @@ Our pi is pi 0.85.1 plus the patches below. This list is the record; keep it cur
 - A `ModelRegistry.login()` facade over the SURE auth adapter `src/core/sure/auth.ts`.
 - SURE run settlement on `agent_settled` instead of `agent_end` / `willRetry`.
 - Opt-in SURE coordination: version 2 failure/review positions, snapshots/diagnoses and complete corrective/continue guidance with harness-only failure/rejection routing; native stage-message continuity and compaction-boundary history trimming; persistent autonomous read-only supervisor sessions with actual role-tagged tool activity. Generic session controls bridge execution holds to agent-core's `shouldStopAfterTurn`; raw session history remains intact. Business gates/retries/finish retain their authority; no workload takeover or per-error quota tree.
+- Supervisor checkpoint navigation derives applied transitions from existing state events, with optional selected-hook provenance and existing log/hook/check/snapshot reads; no additional state ledger or business-state replay.
 - `callContextHandlerAbortable` in `src/core/extensions/runner.ts`, so `context` event handlers abort with `ctx.signal` instead of running to completion after a cancelled run.
 
 `packages/ai`:

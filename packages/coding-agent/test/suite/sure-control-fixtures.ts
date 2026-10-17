@@ -1,7 +1,24 @@
 import { type AssistantMessage, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/compat";
 import type { ExtensionContext } from "../../src/core/extensions/types.ts";
+import { createIsolatedResourceLoader } from "../../src/core/isolated-resource-loader.ts";
+import { createAgentSession } from "../../src/core/sdk.ts";
 import type { IsolatedSessionRequest } from "../../src/core/session-controls.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
+import { SettingsManager } from "../../src/core/settings-manager.ts";
+import type { Harness } from "./harness.ts";
+
+export function fixtureExecutor(harness: Harness, systemPrompt: string) {
+	return createAgentSession({
+		cwd: harness.tempDir,
+		agentDir: harness.tempDir,
+		model: harness.getModel(),
+		modelRuntime: harness.session.modelRuntime,
+		sessionManager: SessionManager.inMemory(harness.tempDir),
+		settingsManager: SettingsManager.inMemory({ compaction: { enabled: false } }),
+		resourceLoader: createIsolatedResourceLoader(systemPrompt),
+		tools: [],
+	});
+}
 
 export function fixtureTranscript(request: IsolatedSessionRequest, cwd: string) {
 	const manager = request.sessionFile

@@ -293,6 +293,7 @@ function applyStatePatch(
 	active: ActiveRun,
 	patchValue: unknown,
 	eventType: string,
+	hookExecutionId?: string,
 ): { ok: boolean; state?: SureDisplayState; repair?: string } {
 	if (patchValue === undefined) {
 		return { ok: true };
@@ -310,7 +311,7 @@ function applyStatePatch(
 	}
 	const runManager = new SureRunManager(active.record.cwd);
 	const previous = runManager.readState(active.record);
-	const state = runManager.updateState(active.record, normalized.state, eventType);
+	const state = runManager.updateState(active.record, normalized.state, eventType, hookExecutionId);
 	if (
 		active.skillPackage.manifest.coordination &&
 		(previous?.phase?.id !== state.phase?.id || previous?.message !== state.message)
@@ -465,6 +466,7 @@ function syncCoordinatedMessages(
 		.find((repair) => repair.source === "supervisor" && repair.unitId === unit);
 	if (
 		repair &&
+		(repair.stopReason === undefined || coordinator.state.pendingRepair?.id === repair.id) &&
 		(!coordinator.state.pendingRepair || coordinator.state.pendingRepair.delivered) &&
 		!view.some(
 			(message) =>
@@ -482,6 +484,7 @@ function syncCoordinatedMessages(
 	if (
 		coordinator.state.status === "executing" &&
 		!coordinator.state.pendingRepair &&
+		coordinator.state.reviewedFailureVersion !== undefined &&
 		continued?.decision === "continue" &&
 		continued.unitId === unit
 	) {
@@ -877,7 +880,7 @@ async function finishActiveRun(
 			content: toolText("SURE finish was interrupted; no completion was accepted."),
 			details: { runId: active.record.runId, accepted: false } satisfies SureFinishDetails,
 		};
-	applyStatePatch(pi, ctx, active, gate.state_patch, "pre_finish_state");
+	applyStatePatch(pi, ctx, active, gate.state_patch, "pre_finish_state", gate.statePatchHookId);
 	if (!active.terminalizing) observeCoordinatedCheck(active, ctx, gate.checks ?? gate.check, gate.state_patch);
 	if (!gate.ok) {
 		const repair = gate.repair ?? gate.message ?? "Repair the Sure artifacts and call sure_finish again.";
@@ -917,7 +920,7 @@ async function finishActiveRun(
 		args: active.record.args,
 		event: { finish, manifest, manifestPath },
 	});
-	applyStatePatch(pi, ctx, active, postFinish.state_patch, "post_finish_state");
+	applyStatePatch(pi, ctx, active, postFinish.state_patch, "post_finish_state", postFinish.statePatchHookId);
 	if (!postFinish.ok) {
 		pi.appendEntry("sure.diagnostic", {
 			type: "warning",
@@ -1191,7 +1194,7 @@ async function settleCoordinatedRun(
 		event: { reason: coordinator.state.stopReason },
 	};
 	const onError = await active.hooks.run("on_error", context);
-	applyStatePatch(pi, ctx, active, onError.state_patch, "coordination_error_state");
+	applyStatePatch(pi, ctx, active, onError.state_patch, "coordination_error_state", onError.statePatchHookId);
 	active.record = manager.updateRun(
 		active.record,
 		{
@@ -1273,7 +1276,7 @@ async function startRun(
 			runDir: active.record.runDir,
 			args,
 		});
-		applyStatePatch(pi, ctx, active, preStart.state_patch, "pre_start_state");
+		applyStatePatch(pi, ctx, active, preStart.state_patch, "pre_start_state", preStart.statePatchHookId);
 		if (!preStart.ok) {
 			if (skillPackage.manifest.coordination) {
 				failCoordinatedEntry(
@@ -1327,7 +1330,7 @@ async function startRun(
 			args,
 			event: { reason: "agent_error", message },
 		});
-		applyStatePatch(pi, ctx, active, onError.state_patch, "on_error_state");
+		applyStatePatch(pi, ctx, active, onError.state_patch, "on_error_state", onError.statePatchHookId);
 		if (skillPackage.manifest.coordination) {
 			failCoordinatedEntry(pi, ctx, active, `Sure run failed to start or continue: ${message}`, setActiveRun);
 			return;
@@ -1960,7 +1963,7 @@ export function createSureExtension(): ExtensionFactory {
 				args: active.record.args,
 				event,
 			});
-			applyStatePatch(pi, ctx, active, gate.state_patch, "pre_tool_call_state");
+			applyStatePatch(pi, ctx, active, gate.state_patch, "pre_tool_call_state", gate.statePatchHookId);
 			observeCoordinatedCheck(
 				active,
 				ctx,
@@ -2104,13 +2107,6 @@ export function createSureExtension(): ExtensionFactory {
 						});
 					return { isError: true };
 				}
-				if (
-					active.coordinator &&
-					Object.keys(active.coordinator.state.observedToolChecks ?? {}).some(
-						(key) => JSON.parse(key)[1] === event.toolCallId,
-					)
-				)
-					return undefined;
 				const gate = await active.hooks.run("post_tool_result", {
 					run: active.record,
 					skill: active.skillPackage.manifest,
@@ -2122,7 +2118,7 @@ export function createSureExtension(): ExtensionFactory {
 				});
 				// Cancellation or new constraints can arrive while a previously started hook awaits.
 				if (active.coordinator && active.coordinator.state.status !== "executing") return undefined;
-				applyStatePatch(pi, ctx, active, gate.state_patch, "post_tool_result_state");
+				applyStatePatch(pi, ctx, active, gate.state_patch, "post_tool_result_state", gate.statePatchHookId);
 				observeCoordinatedCheck(
 					active,
 					ctx,
@@ -2332,7 +2328,7 @@ export function createSureExtension(): ExtensionFactory {
 				args: active.record.args,
 				event: { reason: "session_shutdown" },
 			});
-			applyStatePatch(pi, ctx, active, onError.state_patch, "on_error_state");
+			applyStatePatch(pi, ctx, active, onError.state_patch, "on_error_state", onError.statePatchHookId);
 			if (active.coordinator) {
 				const report = buildSureFailureReport(
 					active.record,

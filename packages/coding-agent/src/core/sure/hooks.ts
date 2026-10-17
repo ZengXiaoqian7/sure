@@ -19,6 +19,7 @@ export interface SureGateResult {
 	repair?: string;
 	diagnostics?: unknown;
 	state_patch?: unknown;
+	statePatchHookId?: string;
 }
 
 export interface SureHookExecution {
@@ -86,6 +87,7 @@ export class SureHookRunner {
 	async run(point: SureHookPoint, context: Omit<SureHookContext, "point">): Promise<SureGateResult> {
 		const declarations = this.skillPackage.manifest.hooks?.[point] ?? [];
 		let statePatch: unknown;
+		let statePatchHookId: string | undefined;
 		let check: SureHookResult["check"];
 		const checks: NonNullable<SureHookResult["check"]>[] = [];
 		const invocationId = randomUUID();
@@ -143,13 +145,14 @@ export class SureHookRunner {
 			check = result.check ?? check;
 			if (result.state_patch !== undefined) {
 				statePatch = result.state_patch;
+				statePatchHookId = `${invocationId}-${index}`;
 			}
 			failure = toGateFailure(result, `Sure ${point} hook rejected the action.`);
 		}
 		const gate = failure
 			? { ...failure, state_patch: failure.state_patch ?? statePatch }
 			: { ok: true, state_patch: statePatch, check };
-		return this.skillPackage.manifest.coordination ? { ...gate, checks } : gate;
+		return this.skillPackage.manifest.coordination ? { ...gate, checks, statePatchHookId } : gate;
 	}
 
 	private async runHook(

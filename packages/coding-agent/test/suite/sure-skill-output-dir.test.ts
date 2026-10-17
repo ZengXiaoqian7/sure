@@ -1,12 +1,16 @@
 import { mkdirSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 import { preStart as evalPreStart } from "../../../../sure/skills/sure_eval/hooks/index.ts";
 import { preStart } from "../../../../sure/skills/sure_infer/hooks/index.ts";
 import type { SureHookContext } from "../../src/core/sure/types.ts";
 
 const INFER_PACKAGE_DIR = resolve(__dirname, "../../../../sure/skills/sure_infer");
 const EVAL_PACKAGE_DIR = resolve(__dirname, "../../../../sure/skills/sure_eval");
+
+afterAll(() => {
+	rmSync(resolve(__dirname, "tmp-eval-output-dir"), { recursive: true, force: true });
+});
 
 function preStartCtx(skill: string, packageDir: string, name: string, args: string): SureHookContext {
 	const root = resolve(__dirname, "tmp-eval-output-dir", name);

@@ -20,7 +20,7 @@ import { writeSureJson } from "../../src/core/sure/evidence.ts";
 import { diagnoseSureRun } from "../../src/core/sure/supervisor.ts";
 import type { SureRunRecord, SureSkillPackage } from "../../src/core/sure/types.ts";
 import { readSureUserContext, syncSureUserContext } from "../../src/core/sure/user-context.ts";
-import { createHarness, type Harness } from "./harness.ts";
+import { createHarness, getMessageText, type Harness } from "./harness.ts";
 import { fixtureExecutor, pauseDiagnosis, repairHandoff } from "./sure-control-fixtures.ts";
 
 function checkpointReason(outcome: SureDiagnosisOutcome): string {
@@ -98,6 +98,117 @@ afterEach(() => {
 });
 
 describe("Sure independent read-only supervisor", () => {
+	it("keeps the business gate distinct from preflight and accepts project focus hints outside capture scope", async () => {
+		const { harness, coordinator, ctx, result } = await setup();
+		coordinator.run.packageDir = join(coordinator.run.cwd, "skill");
+		mkdirSync(coordinator.run.packageDir);
+		writeFileSync(join(coordinator.run.packageDir, "stage.md"), "Prepare the environment.");
+		coordinator.observe(
+			{
+				unitId: "build_env",
+				outcome: "passed",
+				checker: "pre_tool_call",
+				sourceId: "pre_tool_call:probe",
+				summary: "Probe preflight allowed",
+				inputPaths: [],
+				artifactPaths: [],
+			},
+			["package:stage.md"],
+		);
+		harness.setResponses([
+			(context) => {
+				const packet = JSON.parse(
+					getMessageText(context.messages.filter((message) => message.role === "user").at(-1)).split("\n")[1],
+				);
+				expect(packet.currentGate.summary).toBe("Original CUDA environment failure");
+				expect(packet.latestCheck.summary).toBe("Probe preflight allowed");
+				expect(packet.scope.hints).not.toContain("project:models/demo/loader.py");
+				return fauxAssistantMessage([fauxToolCall("sure_diagnostic_read", { operation: "timeline" })], {
+					stopReason: "toolUse",
+				});
+			},
+			(context) => {
+				const response = context.messages.filter((message) => message.role === "toolResult").at(-1)!;
+				const timeline = JSON.parse(JSON.parse(getMessageText(response)).text);
+				expect(
+					timeline.stages.find((item: { unitId: string }) => item.unitId === "build_env").lastPassed,
+				).toBeUndefined();
+				return repairHandoff(result.repair!, ["project:models/demo/loader.py"]);
+			},
+		]);
+		expect((await diagnoseSureRun(coordinator, ctx, [], stage)).decision).toBe("repair");
+	});
+	it("keeps full rules stable across snapshots and loads whole-run actions only on demand", async () => {
+		const { harness, coordinator, ctx, result } = await setup();
+		writeFileSync(join(coordinator.run.packageDir, "SKILL.md"), "FULL_GLOBAL_RULES");
+		writeFileSync(join(coordinator.run.packageDir, "common.md"), "FULL_COMMON_RULES");
+		const scope = ["package:stage.md", "package:SKILL.md", "package:common.md"];
+		const skill: SureSkillPackage = {
+			manifest: {
+				name: "demo",
+				command: "sure_feed",
+				prompt: "SKILL.md",
+				coordination: { version: 1, commonPrompt: "common.md", stages: [stage] },
+			},
+			packageDir: coordinator.run.packageDir,
+			manifestPath: "",
+			promptPath: "",
+			prompt: "FULL_GLOBAL_RULES",
+			source: "project",
+			sourceRoot: coordinator.run.packageDir,
+		};
+		for (const unitId of ["prior_unit", "build_env"])
+			writeSureJson(join(coordinator.run.runDir, `evidence/tools/${unitId}.json`), {
+				toolCallId: `${unitId}-action`,
+				unitId,
+				toolName: "read",
+				cwd: coordinator.run.cwd,
+				input: { path: `${unitId}-source.txt` },
+				requestedAt: "2000-01-01",
+				execution: "returned",
+				isError: false,
+			});
+		let systemPrompt: string | undefined;
+		for (const iteration of [0, 1]) {
+			coordinator.barrier(scope);
+			harness.setResponses([
+				(context) => {
+					if (iteration === 0) systemPrompt = context.systemPrompt;
+					else expect(context.systemPrompt).toBe(systemPrompt);
+					expect(context.systemPrompt).toContain("FULL_GLOBAL_RULES");
+					expect(context.systemPrompt).toContain("FULL_COMMON_RULES");
+					const packet = JSON.parse(
+						getMessageText(context.messages.filter((message) => message.role === "user").at(-1)).split("\n")[1],
+					);
+					expect(JSON.stringify(packet)).not.toContain("prior_unit-action");
+					expect(packet.navigation.actionIndex).toEqual({ count: 2, operation: "actions", unitId: "build_env" });
+					return fauxAssistantMessage(
+						[
+							fauxToolCall("sure_diagnostic_read", { operation: "actions", unitId: "build_env" }),
+							fauxToolCall("sure_diagnostic_read", { operation: "timeline" }),
+						],
+						{ stopReason: "toolUse" },
+					);
+				},
+				(context) => {
+					const replies = context.messages.filter((message) => message.role === "toolResult").slice(-2);
+					expect(replies.every((message) => !message.isError)).toBe(true);
+					expect(getMessageText(replies[0])).toContain("build_env-action");
+					expect(getMessageText(replies[0])).not.toContain("prior_unit-action");
+					expect(getMessageText(replies[1])).toContain("prior_unit-action");
+					return repairHandoff(result.repair!);
+				},
+			]);
+			const outcome = await diagnoseSureRun(coordinator, ctx, scope, stage, skill);
+			expect(outcome.decision).toBe("repair");
+			coordinator.acceptDiagnosis(outcome);
+			coordinator.observe(
+				{ ...coordinator.state.lastCheck!, summary: `Gate failed at iteration ${iteration}` },
+				scope,
+			);
+		}
+		expect(coordinator.state.attempts).toHaveLength(2);
+	});
 	it.each([false, true])(
 		"reads external runtime sources while preserving freshness and write scope, changed=%s",
 		async (changed) => {

@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import { parseSureDiagnosisResult } from "./coordination-contracts.ts";
 import {
+	isSureBusinessCheck,
 	SURE_COORDINATION_LIMITS,
 	type SureCheckEvidence,
 	type SureCoordinationLimits,
@@ -10,6 +12,7 @@ import {
 	type SureDiagnosisResult,
 	type SureToolObservation,
 } from "./coordination-types.ts";
+import { loadSureCheckRecords } from "./diagnostic-view.ts";
 import {
 	assertSureDiagnosticSourcesCurrent,
 	captureSureSnapshot,
@@ -144,6 +147,72 @@ export class SureCoordinator {
 		return path && existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) : undefined;
 	}
 
+	private sameOperation(left: SureToolObservation, right: SureToolObservation): boolean {
+		return left.toolName === right.toolName && left.cwd === right.cwd && isDeepStrictEqual(left.input, right.input);
+	}
+
+	private sameFailure(left: SureCheckEvidence, right: SureCheckEvidence): boolean {
+		if (
+			left.unitId !== right.unitId ||
+			left.sourceId !== right.sourceId ||
+			left.checker !== right.checker ||
+			left.failureKind !== right.failureKind
+		)
+			return false;
+		if (left.condition || right.condition)
+			return left.condition?.id === right.condition?.id && left.condition?.target === right.condition?.target;
+		if (left.failureKind === "tool") {
+			const original = this.observation(left);
+			const current = this.observation(right);
+			if (
+				!original ||
+				!current ||
+				!this.sameOperation(original, current) ||
+				original.rejection !== current.rejection
+			)
+				return false;
+		} else if (!isSureBusinessCheck(left) || !(left.sourceId || left.checker)) return false;
+		// Without a skill-supplied identity, changed failure evidence has an unknown relationship.
+		return (
+			isDeepStrictEqual(left.artifactPaths, right.artifactPaths) &&
+			left.repair === right.repair &&
+			left.stderr === right.stderr &&
+			left.stdout === right.stdout &&
+			left.exitCode === right.exitCode &&
+			left.summary === right.summary
+		);
+	}
+
+	private unresolvedChecks(firstVersion: number, beforeVersion: number, unitId: string) {
+		let failures: ReturnType<typeof loadSureCheckRecords> = [];
+		let previousFailure: SureCheckEvidence | undefined;
+		for (const record of loadSureCheckRecords(this)) {
+			if (record.version < firstVersion || record.version >= beforeVersion || record.check.unitId !== unitId)
+				continue;
+			const check = record.check;
+			const action = this.observation(check);
+			const actual = check.action
+				? action &&
+					!action.duringHold &&
+					(action.execution === "returned" || (action.execution === "skipped" && action.rejection))
+				: check.failureKind !== "tool";
+			if (!actual) continue;
+			if (isSureBusinessCheck(check) && check.outcome === "passed") failures = [];
+			if (action?.execution === "returned" && !action.isError)
+				failures = failures.filter(({ check: failed }) => {
+					const original = failed.failureKind === "tool" && this.observation(failed);
+					return !original || !this.sameOperation(original, action);
+				});
+			if (check.outcome !== "blocked") continue;
+			const resolved = previousFailure;
+			if (check.localProgress === true && check.condition?.localRepair === true && resolved)
+				failures = failures.filter(({ check: failed }) => !this.sameFailure(failed, resolved));
+			failures.push(record);
+			previousFailure = check;
+		}
+		return failures;
+	}
+
 	observe(check: SureCheckEvidence, scope: string[]): SureSnapshot {
 		this.assertOwner?.();
 		const eventKey = check.action
@@ -162,6 +231,7 @@ export class SureCoordinator {
 		);
 		const previous =
 			this.state.unresolvedCheckVersion === undefined ? undefined : this.checkAt(this.state.unresolvedCheckVersion);
+		const previousFailure = this.state.lastFailure;
 		const observation = this.observation(check);
 		const returned = check.action
 			? observation?.execution === "returned" && !observation.duringHold
@@ -178,7 +248,7 @@ export class SureCoordinator {
 		if (task && task.unitId === check.unitId) {
 			task.checkVersions.push(version);
 			task.afterSnapshotId = snapshot.id;
-			if (returned && check.failureKind !== "tool" && check.outcome !== "pending" && check.outcome !== "unchanged") {
+			if (returned && isSureBusinessCheck(check) && check.outcome !== "pending" && check.outcome !== "unchanged") {
 				task.gateOutcome = check.outcome;
 				task.gateCheckVersion = version;
 			}
@@ -196,17 +266,27 @@ export class SureCoordinator {
 			if (task) task.remainingBlocker = check.summary;
 			// Exhaustion stays a business observation; it neither starts diagnosis nor removes executor rights.
 			if (check.outcome === "blocked") {
-				const sameBatch =
-					previous?.action?.batchId !== undefined && previous.action.batchId === check.action?.batchId;
-				const sameCall = previous?.action && previous.action.toolCallId === check.action?.toolCallId;
-				const sameHook =
-					previous?.checkId?.includes(":") &&
-					check.checkId?.includes(":") &&
-					previous.checkId.slice(0, previous.checkId.lastIndexOf(":")) ===
-						check.checkId.slice(0, check.checkId.lastIndexOf(":"));
 				const clearLocalProgress = check.localProgress === true && check.condition?.localRepair === true;
+				// Reuse immutable checks so interleaved errors retain their own correction opportunity.
+				let failures =
+					previous?.unitId === check.unitId
+						? this.unresolvedChecks(this.state.unresolvedCheckVersion!, version, check.unitId)
+						: [];
+				if (clearLocalProgress && previousFailure)
+					failures = failures.filter(({ check: failed }) => !this.sameFailure(failed, previousFailure));
+				const related = clearLocalProgress
+					? undefined
+					: failures.filter(({ check: failed }) => this.sameFailure(failed, check)).at(-1)?.check;
+				const sameBatch =
+					related?.action?.batchId !== undefined && related.action.batchId === check.action?.batchId;
+				const sameCall = related?.action && related.action.toolCallId === check.action?.toolCallId;
+				const sameHook =
+					related?.checkId?.includes(":") &&
+					check.checkId?.includes(":") &&
+					related.checkId.slice(0, related.checkId.lastIndexOf(":")) ===
+						check.checkId.slice(0, check.checkId.lastIndexOf(":"));
 				if (
-					previous?.unitId === check.unitId &&
+					related &&
 					!sameBatch &&
 					!sameCall &&
 					!sameHook &&
@@ -216,10 +296,9 @@ export class SureCoordinator {
 					this.requestDiagnosis(
 						`Execution remains blocked after failure feedback (check:${version}): ${check.summary}`,
 					);
-				if (!previous || previous.unitId !== check.unitId || clearLocalProgress)
-					this.state.unresolvedCheckVersion = version;
+				this.state.unresolvedCheckVersion = failures[0]?.version ?? version;
 			}
-		} else if (returned && check.outcome === "passed") {
+		} else if (returned && isSureBusinessCheck(check) && check.outcome === "passed") {
 			this.state.unresolvedCheckVersion = undefined;
 			this.state.lastSuccessSnapshot = snapshot.id;
 			this.state.lastSuccessUnit = check.unitId;
@@ -239,12 +318,14 @@ export class SureCoordinator {
 			check.action
 		) {
 			const original = this.observation(previous);
-			if (
-				original &&
-				previous.action.toolName === check.action.toolName &&
-				JSON.stringify(original.input) === JSON.stringify(observation.input)
-			)
-				this.state.unresolvedCheckVersion = undefined;
+			if (original && this.sameOperation(original, observation)) {
+				// Clearing one operation must not discard another interleaved blocker.
+				this.state.unresolvedCheckVersion = this.unresolvedChecks(
+					this.state.unresolvedCheckVersion!,
+					version + 1,
+					check.unitId,
+				)[0]?.version;
+			}
 		}
 		if (eventKey) {
 			this.state.observedToolChecks ??= {};

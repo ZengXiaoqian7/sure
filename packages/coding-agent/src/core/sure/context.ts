@@ -122,7 +122,7 @@ export function buildSureCommonPrompt(skill: SureSkillPackage, run: SureRunRecor
 		`Runtime paths (absolute): ${JSON.stringify({ projectRoot: run.cwd, packageDir: run.packageDir, runDir: run.runDir })}`,
 		"Historical passed checks identify prior outputs, not current existence. Pending, skipped and tool success are not validation; use recorded paths, never infer filenames from unit IDs.",
 		"Preserve the supervisor task's complete goal, original permissions and required runtime dependencies. focusPaths are investigation hints, not a write allowlist. Related objects remain within the original goal; the unchanged original gate determines business progression.",
-		"Correct clear local problems directly. The harness requests supervision when actual correction remains blocked without verified local progress. Changed error wording or commands alone do not prove progress; original check results remain authoritative.",
+		"Correct clear local problems directly. The harness requests supervision when a later actual failure is linked to the same unresolved condition. Independent new failures retain local correction; an unknown relationship is not a repeated condition. Original check results remain authoritative.",
 		"Follow the supervisor guidance as one complete goal, including supporting probes and corrections. A successful probe is not a business gate pass. Continue normally after the original gate passes; no return for supervisor approval is required.",
 	].join("\n\n");
 }

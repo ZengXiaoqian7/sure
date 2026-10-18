@@ -84,22 +84,26 @@ afterEach(() => {
 });
 
 describe("Sure minimal investigation routing", () => {
-	it("routes a later actual gate failure before the default third attempt despite changed error wording", () => {
+	it("routes a repeated declared gate condition despite changed wording", () => {
 		const coordinator = new SureCoordinator(setup(), "build_env", []);
-		coordinator.observe(check(), []);
+		const condition = { id: "dependency", target: "runtime" };
+		coordinator.observe({ ...check(), condition }, []);
 		expect(coordinator.state.status).toBe("executing");
-		coordinator.observe({ ...check(), summary: "Now a different dependency is missing" }, []);
+		coordinator.observe({ ...check(), condition, summary: "Same runtime condition after correction" }, []);
 		expect(coordinator.state.status).toBe("yielding");
 		expect(coordinator.state.yieldReason).toContain("check:2");
 		expect(coordinator.state.repairs).toEqual([]);
 	});
-	it("counts a complete tool batch as one feedback window, then routes a different failed command", () => {
+	it("retains separate correction opportunities across batches and reload, then routes a repeated operation", () => {
 		const run = setup();
-		const coordinator = new SureCoordinator(run, "build_env", []);
+		let coordinator = new SureCoordinator(run, "build_env", []);
 		coordinator.observe(toolCheck(run, "one", "batch-1", { path: "A" }), []);
 		coordinator.observe(toolCheck(run, "two", "batch-1", { path: "B" }), []);
 		expect(coordinator.state.status).toBe("executing");
 		coordinator.observe({ ...toolCheck(run, "three", "batch-2", { path: "C" }), summary: "Changed failure" }, []);
+		expect(coordinator.state.status).toBe("executing");
+		coordinator = new SureCoordinator(run, "build_env", []);
+		coordinator.observe(toolCheck(run, "four", "batch-3", { path: "B" }), []);
 		expect(coordinator.state.status).toBe("yielding");
 	});
 	it("does not count separate subchecks from one hook invocation as a corrective attempt", () => {
@@ -119,7 +123,41 @@ describe("Sure minimal investigation routing", () => {
 		expect(coordinator.state.status).toBe("executing");
 		writeFileSync(join(run.runDir, "artifacts/env.json"), '{"different":true}');
 		coordinator.observe({ ...check(), condition: { id: "other-field", localRepair: true } }, []);
+		expect(coordinator.state.status).toBe("executing");
+		coordinator.observe({ ...check(), condition: { id: "other-field", localRepair: true } }, []);
 		expect(coordinator.state.status).toBe("yielding");
+	});
+	it("does not equate different gate evidence, checker, target or preflight with an earlier failure", () => {
+		const coordinator = new SureCoordinator(setup(), "build_env", []);
+		coordinator.observe(check(), []);
+		coordinator.observe({ ...check(), summary: "Different missing dependency" }, []);
+		coordinator.observe({ ...check(), checker: "another_gate" }, []);
+		coordinator.observe({ ...check(), checker: "pre_tool_call", sourceId: "pre_tool_call:gate" }, []);
+		coordinator.observe({ ...check(), condition: { id: "field", target: "A" } }, []);
+		coordinator.observe({ ...check(), condition: { id: "field", target: "B" } }, []);
+		expect(coordinator.state.status).toBe("executing");
+	});
+	it("keeps an interleaved failed operation after the first operation succeeds", () => {
+		const run = setup();
+		let coordinator = new SureCoordinator(run, "build_env", []);
+		coordinator.observe(toolCheck(run, "a1", "batch-1", { path: "A" }), []);
+		coordinator.observe(toolCheck(run, "b1", "batch-1", { path: "B" }), []);
+		coordinator.observe(toolCheck(run, "a2", "batch-2", { path: "A" }, false), []);
+		expect(coordinator.state.unresolvedCheckVersion).toBe(2);
+		coordinator = new SureCoordinator(run, "build_env", []);
+		coordinator.observe(toolCheck(run, "b2", "batch-3", { path: "B" }), []);
+		expect(coordinator.state.status).toBe("yielding");
+	});
+	it.each(["A", "B"])("scopes verified local progress to its preceding blocker when %s recurs", (id) => {
+		const run = setup();
+		let coordinator = new SureCoordinator(run, "build_env", []);
+		coordinator.observe({ ...check(), condition: { id: "A" } }, []);
+		coordinator.observe({ ...check(), condition: { id: "B" } }, []);
+		coordinator.observe({ ...check(), condition: { id: "C", localRepair: true }, localProgress: true }, []);
+		expect(coordinator.state.unresolvedCheckVersion).toBe(1);
+		coordinator = new SureCoordinator(run, "build_env", []);
+		coordinator.observe({ ...check(), condition: { id } }, []);
+		expect(coordinator.state.status).toBe(id === "A" ? "yielding" : "executing");
 	});
 	it("clears a failed read after that exact operation succeeds, preserving a later read's local chance", () => {
 		const run = setup();
@@ -129,6 +167,17 @@ describe("Sure minimal investigation routing", () => {
 		expect(coordinator.state.unresolvedCheckVersion).toBeUndefined();
 		coordinator.observe(toolCheck(run, "read-B-failed", "batch-3", { path: "B" }), []);
 		expect(coordinator.state.status).toBe("executing");
+	});
+	it("does not erase a business blocker whose producing tool succeeded when an earlier read is fixed", () => {
+		const run = setup();
+		const coordinator = new SureCoordinator(run, "build_env", []);
+		coordinator.observe(toolCheck(run, "read-missing", "batch-1", { path: "A" }), []);
+		const producing = toolCheck(run, "produce", "batch-2", { path: "B" }, false);
+		coordinator.observe({ ...check(), action: producing.action }, []);
+		coordinator.observe(toolCheck(run, "read-fixed", "batch-3", { path: "A" }, false), []);
+		expect(coordinator.state.unresolvedCheckVersion).toBe(2);
+		coordinator.observe(check(), []);
+		expect(coordinator.state.status).toBe("yielding");
 	});
 	it("keeps pending, unchanged, skipped and held observations from becoming failed rechecks", () => {
 		const run = setup();
@@ -192,8 +241,25 @@ describe("Sure minimal investigation routing", () => {
 		coordinator.requestDiagnosis("Please inspect this blocker again.");
 		expect(coordinator.state.status).toBe("executing");
 		coordinator.observe(toolCheck(run, "failed-again", "batch-2", { path: "B" }), []);
+		expect(coordinator.state.status).toBe("executing");
+		coordinator.observe(toolCheck(run, "failed-original", "batch-3", { path: "A" }), []);
 		expect(coordinator.state.status).toBe("yielding");
 		expect(coordinator.state.repairs).toEqual([]);
+	});
+	it("never settles a repair or overwrites its gate outcome on successful preflight or tool observation", () => {
+		const run = setup();
+		const coordinator = new SureCoordinator(run, "build_env", []);
+		coordinator.observe(check(), []);
+		coordinator.acceptDiagnosis(diagnosis(coordinator));
+		const id = coordinator.state.pendingRepair!.id;
+		coordinator.observe({ ...check("passed"), checker: "pre_tool_call", sourceId: "pre_tool_call:gate" }, []);
+		coordinator.observe(toolCheck(run, "probe", "batch-1", { path: "probe" }, false), []);
+		expect(coordinator.state.pendingRepair?.id).toBe(id);
+		expect(coordinator.state.unresolvedCheckVersion).toBe(1);
+		expect(coordinator.state.repairs![0].gateOutcome).toBeUndefined();
+		coordinator.observe(check("passed"), []);
+		expect(coordinator.state.pendingRepair).toBeUndefined();
+		expect(coordinator.state.repairs![0]).toMatchObject({ gateOutcome: "passed", gateCheckVersion: 4 });
 	});
 	it("retains supervisor task text and only the original gate result after dispatch clears", () => {
 		const run = setup();

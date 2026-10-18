@@ -9,11 +9,12 @@ import type { ExtensionContext } from "../extensions/types.ts";
 import type { IsolatedSession } from "../session-controls.ts";
 import { createUsageTotals } from "../usage-totals.ts";
 import { parseSureDiagnosisResult } from "./coordination-contracts.ts";
-import type {
-	SureDiagnosisCheckpoint,
-	SureDiagnosisOutcome,
-	SureDiagnosisResult,
-	SureStageDeclaration,
+import {
+	isSureBusinessCheck,
+	type SureDiagnosisCheckpoint,
+	type SureDiagnosisOutcome,
+	type SureDiagnosisResult,
+	type SureStageDeclaration,
 } from "./coordination-types.ts";
 import type { SureCoordinator } from "./coordinator.ts";
 import {
@@ -260,19 +261,13 @@ export async function diagnoseSureRun(
 				);
 				if (saved?.status !== "text" || saved.text === undefined)
 					throw new Error(`Global task instructions were not captured as text: ${path}.`);
-				return `<sure_global_task source=${JSON.stringify({ path: saved.path, snapshotId: latestId, sha256: saved.sha256 })}>\n${saved.text}\n</sure_global_task>`;
+				return `<sure_global_task source=${JSON.stringify({ path: saved.path, sha256: saved.sha256 })}>\n${saved.text}\n</sure_global_task>`;
 			})
 			.join("\n\n");
 		const index = loadSureDiagnosticIndex(coordinator);
 		const currentCheck = index.checks.filter(({ check }) => check.unitId === state.unitId).at(-1);
 		const businessCheck = index.checks
-			.filter(
-				({ check }) =>
-					check.unitId === state.unitId &&
-					check.failureKind !== "tool" &&
-					!check.checker?.startsWith("tool:") &&
-					check.failureKind !== "no_progress",
-			)
+			.filter(({ check }) => check.unitId === state.unitId && isSureBusinessCheck(check))
 			.at(-1);
 		const currentAttempt = sureCurrentRepairAttempt(coordinator, index);
 		const attemptCalls = new Set(currentAttempt?.actions.map((action) => action.toolCallId));
@@ -298,7 +293,7 @@ export async function diagnoseSureRun(
 				return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 			});
 		const repairScope = {
-			allowed: scope.filter(
+			hints: scope.filter(
 				(value) =>
 					!value.startsWith("package:") &&
 					!index.readOnlyScope.includes(value) &&
@@ -326,7 +321,7 @@ export async function diagnoseSureRun(
 		};
 		const visibleRepairScope = {
 			...repairScope,
-			allowed: repairScope.allowed.filter((value, index, paths) => {
+			hints: repairScope.hints.filter((value, index, paths) => {
 				const path = resolveSureEvidencePath(coordinator.run, value);
 				return !paths.some((other, otherIndex) => {
 					const root = resolveSureEvidencePath(coordinator.run, other);
@@ -450,9 +445,9 @@ export async function diagnoseSureRun(
 		};
 		const operationParameters = {
 			timeline: ["offset"],
-			actions: ["offset", "toolCallId", "toolCallIds"],
+			actions: ["offset", "unitId", "toolCallId", "toolCallIds"],
 			user_context: ["offset"],
-			checks: ["offset"],
+			checks: ["offset", "unitId"],
 			hooks: ["offset", "hookId"],
 			repairs: ["offset", "repairId"],
 			snapshot: ["offset", "path", "snapshotId"],
@@ -467,7 +462,7 @@ export async function diagnoseSureRun(
 			name: "sure_diagnostic_read",
 			label: "Read SURE diagnostic evidence",
 			description:
-				"Inspect relevant evidence as needed from the initial navigation and current failure. snapshot/diff without path return indexes; with path they return saved content/diff. file/search inspect relevant source text, including absolute runtime paths, independently of capture scope. search returns sourceOffset and line for file continuation. list(path) lists one directory level, never recursively. Evidence pages use explicit nextOffset; text pages contain at most 2,000 lines or 50 KiB, without a total read allowance. Partial text is not complete inspection. No writes or process execution.",
+				"Inspect relevant evidence as needed from the initial navigation and current failure. Use checkVersion for one exact check; actions/checks accept unitId to filter before paging. actions accepts one to four toolCallIds. snapshot/diff without path return indexes; with path they return saved content/diff. file/search read ONE TEXT FILE, not a directory; use list(path) first to discover filenames. search returns sourceOffset and line for file continuation. offset is a UTF-16 CHARACTER position, never a line number, check version or action index. Continue with the exact returned nextOffset. Text pages contain at most 2,000 lines or 50 KiB, without a total read allowance. Partial text is not complete inspection. No writes or process execution.",
 			parameters: Type.Object({
 				operation: StringEnum([
 					"timeline",
@@ -484,7 +479,14 @@ export async function diagnoseSureRun(
 					"check",
 					"log",
 				] as const),
-				offset: Type.Optional(Type.Integer({ minimum: 0 })),
+				offset: Type.Optional(
+					Type.Integer({
+						minimum: 0,
+						description:
+							"UTF-16 character offset; use nextOffset or search.sourceOffset, not a line/check number.",
+					}),
+				),
+				unitId: Type.Optional(Type.String({ minLength: 1 })),
 				path: Type.Optional(Type.String()),
 				query: Type.Optional(Type.String({ minLength: 1, maxLength: 32_000 })),
 				snapshotId: Type.Optional(Type.String()),
@@ -520,6 +522,11 @@ export async function diagnoseSureRun(
 				if (params.operation === "timeline") {
 					value = timeline;
 				} else if (params.operation === "actions") {
+					const actions = params.unitId
+						? index.actions.filter(
+								(action) => action.unitId === params.unitId || action.checkUnitId === params.unitId,
+							)
+						: index.actions;
 					if (params.toolCallIds) {
 						if (
 							params.toolCallId ||
@@ -529,29 +536,31 @@ export async function diagnoseSureRun(
 						)
 							throw new Error("Use one to four unique action IDs, without toolCallId.");
 						value = params.toolCallIds.map((id) => {
-							const action = index.actions.find((action) => action.toolCallId === id);
+							const action = actions.find((action) => action.toolCallId === id);
 							if (!action) throw new Error("Unknown tool action identity.");
 							return sureActionDetails(action);
 						});
 					} else if (params.toolCallId) {
-						const action = index.actions.find((action) => action.toolCallId === params.toolCallId);
+						const action = actions.find((action) => action.toolCallId === params.toolCallId);
 						if (!action) throw new Error("Unknown tool action identity.");
 						value = sureActionDetails(action);
-					} else value = sureActionIndex(index.actions);
+					} else value = sureActionIndex(actions);
 				} else if (params.operation === "user_context") {
 					value = userContext;
 				} else if (params.operation === "checks") {
-					value = index.checks.map(({ version, check, snapshotId, timestamp, repairId }) => ({
-						version,
-						unitId: check.unitId,
-						outcome: check.outcome,
-						summary: check.summary,
-						checker: check.checker,
-						action: check.action,
-						snapshotId,
-						timestamp,
-						repairId,
-					}));
+					value = index.checks
+						.filter(({ check }) => !params.unitId || check.unitId === params.unitId)
+						.map(({ version, check, snapshotId, timestamp, repairId }) => ({
+							version,
+							unitId: check.unitId,
+							outcome: check.outcome,
+							summary: check.summary,
+							checker: check.checker,
+							action: check.action,
+							snapshotId,
+							timestamp,
+							repairId,
+						}));
 				} else if (params.operation === "hooks") {
 					value = params.hookId
 						? index.hooks.find((hook) => hook.id === params.hookId)
@@ -664,7 +673,10 @@ export async function diagnoseSureRun(
 							throw new Error(`Saved diagnostic content unavailable: ${saved?.status ?? "not_captured"}.`);
 						if (saved && saved.status !== "over_limit")
 							throw new Error(`Saved diagnostic content unavailable: ${saved.status}.`);
-						if (!statSync(path).isFile()) throw new Error("Diagnostic evidence is not a text file.");
+						if (!statSync(path).isFile())
+							throw new Error(
+								"file/search requires one text file. Use list(path) to discover directory entries, then read or search a file.",
+							);
 						const content = readFileSync(path);
 						if (content.includes(0) || !Buffer.from(content.toString("utf8"), "utf8").equals(content))
 							throw new Error("Binary content is not diagnostic text.");
@@ -750,12 +762,7 @@ export async function diagnoseSureRun(
 				assertSureDiagnosticSourcesCurrent(coordinator.run, activeAttempt.readKeys);
 				for (const target of params.focusPaths ?? []) {
 					const path = resolveSureEvidencePath(coordinator.run, target);
-					if (
-						!path ||
-						!sureEvidenceTextAllowed(path) ||
-						isDeclared(path, repairScope.readOnly) ||
-						!isDeclared(path, repairScope.allowed)
-					)
+					if (!path || !sureEvidenceTextAllowed(path) || isDeclared(path, repairScope.readOnly))
 						throw new Error("Focus path is outside original task permissions.");
 				}
 				const result: SureDiagnosisResult = {
@@ -773,7 +780,7 @@ export async function diagnoseSureRun(
 					targetFiles: [],
 					validation: "The unchanged original unit gate validates the actual result.",
 					stopBoundary:
-						"Continue clear local corrections. The harness investigates continued actual failures without verified local progress, including changed or uncertain errors. A passed original gate does not require routine reassessment. Supporting probes belong to the complete correction; there is no evidence-return or approval workflow. Supervisor business stop is disabled.",
+						"Continue clear local corrections. The harness investigates later actual failures linked to the same unresolved condition; independent or uncertain errors are not automatically related. A passed original gate does not require routine reassessment. Supporting probes belong to the complete correction; there is no evidence-return or approval workflow. Supervisor business stop is disabled.",
 				};
 				candidates.push({ callId, result });
 				return {
@@ -998,12 +1005,12 @@ export async function diagnoseSureRun(
 		accountedUsage = currentUsage ?? createUsageTotals();
 		update();
 		const investigationGuide = [
-			"checkpointTimeline shows recorded applied checkpoint changes, not inferred tool progress or a replayable filesystem. Field values are short previews; use log with logOffset/previousLogOffset for complete recorded states, hooks with hookId for the selected patch source, and check with checkVersion for its observed snapshot. Null links and unreadableOffsets are unknown; never infer causality from nearby timestamps. Snapshot coverage does not guarantee all artifacts from that point were retained, and live files are not historical versions.",
+			"timeline provides checkpointTimeline: recorded applied checkpoint changes, not inferred tool progress or a replayable filesystem. Field values are short previews; use log with logOffset/previousLogOffset for complete recorded states, hooks with hookId for the selected patch source, and check with checkVersion for its observed snapshot. Null links and unreadableOffsets are unknown; never infer causality from nearby timestamps. Snapshot coverage does not guarantee all artifacts from that point were retained, and live files are not historical versions.",
 			"Investigate one complete current condition, not one task per object. Read global instructions, current task, user constraints and actual actions together. Preserve executor autonomy and necessary installation/runtime objects; focusPaths are hints, never a new write allowlist. Work-volume and repair counts are observations, not new business retry caps.",
 			"The original business checks remain authoritative. Evidence scope is not a prerequisite list: inputPaths/snapshotPaths describe inspection coverage, not required inputs. A guessed read path and its ENOENT do not establish a required artifact or producer. A successful tool result is not a passed gate; a historical pass does not prove current file presence. not_captured or truncated coverage is unknown, not missing.",
-			"The initial navigation covers every stage and action identity, current failure and correction records. Use actions/checks/hooks/repairs for details and file/search/list to inspect relevant project or runtime sources, including absolute paths. Runtime dependency source text is readable; secrets, weights and binary payloads are excluded. No shell or process execution is available. If a real probe is needed, include it with the resulting corrective steps and original validation in one complete guidance task. Do not ask the executor to collect results and return for approval.",
-			"Evidence responses are pages: assemble text using explicit nextOffset until complete when full inspection matters. format=json means assembled JSON; format=text is raw source text. Search offsets use the same character units as file reads. No mandatory navigation reread or binary-search procedure applies. Clear local corrections remain with the executor; continued actual failures or uncertain relationships warrant timely help. Same-batch results are not post-feedback corrections.",
-			"Inspect what the executor actually tried and its current intended next step before attributing the blocker to an earlier failure. Request a repair only when evidence supports changing the action. Use sure_continue_execution with concrete guidance when the existing plan remains viable; it creates no repair. Missing initial evidence requires autonomous reads; necessary real probes belong in complete corrective guidance, never an evidence-return task. Use sure_pause_diagnosis only when the investigation itself cannot proceed and needs user recovery. Only the original business lifecycle can end the task.",
+			"The initial packet supplies the current failure, correction and navigation entry points. Use actions/checks with unitId or exact identities for relevant details; timeline retains the complete whole-run stage/action/checkpoint indexes. Use hooks/repairs for details and file/search/list to inspect relevant project or runtime sources, including absolute paths. Runtime dependency source text is readable; secrets, weights and binary payloads are excluded. No shell or process execution is available. If a real probe is needed, include it with the resulting corrective steps and original validation in one complete guidance task. Do not ask the executor to collect results and return for approval.",
+			"Evidence responses are pages: assemble text using explicit nextOffset until complete when full inspection matters. format=json means assembled JSON; format=text is raw source text. Search offsets use the same character units as file reads. No mandatory navigation reread or binary-search procedure applies. Clear local corrections remain with the executor. Distinguish the same unresolved condition from independent new failures and unknown relationships; a shared unit or changed wording alone proves neither recurrence nor progress. Same-batch results are not post-feedback corrections.",
+			"Inspect what the executor actually tried and its current intended next step before attributing the blocker to an earlier failure. Account for recorded side effects of abandoned repair routes, including dependency/lock/runtime mismatches; do not narrow a complete goal to one file when other existing changes need correction. Request a repair only when evidence supports changing the action. Use sure_continue_execution with concrete guidance when the existing plan remains viable; it creates no repair. Missing initial evidence requires autonomous reads; necessary real probes belong in complete corrective guidance, never an evidence-return task. Use the original artifact/gate dispatch route for validation; do not prescribe a redundant manual full validation when the original hook will execute it. A probe never replaces that gate. Use sure_pause_diagnosis only when the investigation itself cannot proceed and needs user recovery. Only the original business lifecycle can end the task.",
 			"Snapshot reads preserve historical versions. Uncaptured live files are labeled with their source and hash; changed live sources invalidate a pending conclusion. A missing file itself is not a valid file reference: cite the check or snapshot that records its absence. diff compares the recorded baseline and current snapshot; use snapshotId for another saved version. Public notes should distinguish facts, hypotheses and counterevidence. Do not infer absence from a permission error.",
 		].join("\n\n");
 		const packet = {
@@ -1015,10 +1022,27 @@ export async function diagnoseSureRun(
 			localTask: stageFile.text,
 			userConstraints: userContext,
 			currentGate: businessCheck?.check ?? null,
+			currentFailure: state.lastFailure ?? null,
+			failureCheckVersion: state.lastFailureCheckVersion ?? null,
 			latestCheck: currentCheck?.check ?? null,
-			previousRepair: state.repairs?.at(-1),
+			previousRepair: state.repairs?.filter((repair) => repair.unitId === ticket.unitId).at(-1),
 			checkpoint: activeAttempt.checkpoint ?? null,
-			navigation: timeline,
+			currentAttempt,
+			navigation: {
+				task: timeline.task,
+				currentStage: timeline.currentStage,
+				executorProgress: timeline.executorProgress,
+				baseline: timeline.baseline,
+				captureCoverage: timeline.captureCoverage,
+				diffEvidence,
+				checkIndex: timeline.checkIndex,
+				hookIndex: timeline.hookIndex,
+				actionIndex: { count: index.actions.length, operation: "actions", unitId: ticket.unitId },
+				checkpointTimeline: { source: "run:events.jsonl", operation: "timeline" },
+				repairDetails: timeline.repairDetails,
+				instruction:
+					"Current condition and correction actions are supplied above. Full whole-run stages, action identities, applied checkpoint transitions and previous diagnoses remain available through timeline; read them when relevant, without substituting live files for historical evidence.",
+			},
 			lastProtocolFeedback: activeAttempt.protocolLastError ?? null,
 			scope: visibleRepairScope,
 			usage: budget(),

@@ -215,7 +215,7 @@ export async function postToolResult(ctx) {
  if(ctx.event.isError) return {ok:true,check:{unitId:"stage",outcome:"blocked",failureKind:"tool",summary:"Execution tool failed",repair:"Inspect and correct the call.",artifactPaths:["run:artifacts/current.json"],inputPaths:[]}};
  const file=join(ctx.runDir,"artifacts/current.json");
  const value=existsSync(file)?JSON.parse(readFileSync(file,"utf8")).value:"pending";
- const check={unitId:"stage",outcome:value==="good"?"passed":value==="pending"?"pending":"blocked",failureKind:value==="format"?"format":"semantic",summary:"Gate saw "+value,artifactPaths:["run:artifacts/current.json"],inputPaths:[]};
+ const check={unitId:"stage",outcome:value==="good"?"passed":value==="pending"?"pending":"blocked",failureKind:value==="format"?"format":"semantic",condition:{id:"expected_value",target:"run:artifacts/current.json"},summary:"Gate saw "+value,artifactPaths:["run:artifacts/current.json"],inputPaths:[]};
  return { ok:value!=="format",repair:value==="format"?"Fix the required field.":undefined,check:${options.omitCheck ? "undefined" : "check"},state_patch:{phase:{id:"stage",status:value==="good"?"running":"blocked"},checkpoint:{resumable:value!=="good",data:{currentUnit:${options.twoStages ? 'value==="good"?"next":"stage"' : '"stage"'},completedUnits:value==="good"?["stage"]:[]}}} };
 }
 export async function preFinish(ctx) {
@@ -394,16 +394,66 @@ describe("Sure executor/supervisor handoff", () => {
 		const fixture = await setup();
 		fixture.harness.setResponses([
 			fauxAssistantMessage([fauxToolCall("work", { value: "tool-error" })], { stopReason: "toolUse" }),
-			fauxAssistantMessage([fauxToolCall("work", { value: "tool-error-again" })], { stopReason: "toolUse" }),
+			fauxAssistantMessage([fauxToolCall("work", { value: "tool-error" })], { stopReason: "toolUse" }),
 			fauxAssistantMessage([fauxToolCall("work", { value: "good" })], { stopReason: "toolUse" }),
 			() => fixture.finish(),
 		]);
 		await fixture.harness.session.prompt("/sure_feed model=demo");
 		expect(fixture.diagnoses).toBe(1);
-		expect(fixture.executed).toEqual(["tool-error", "tool-error-again", "good"]);
+		expect(fixture.executed).toEqual(["tool-error", "tool-error", "good"]);
 		expect(state(fixture.harness).repairs).toHaveLength(1);
 		expect(JSON.parse(readFileSync(join(runDir(fixture.harness), "run.json"), "utf8")).status).toBe("success");
 	});
+	it("keeps independent tool and control errors local despite sharing a unit", async () => {
+		const fixture = await setup({ preflightReject: true });
+		fixture.harness.setResponses([
+			fauxAssistantMessage([fauxToolCall("work", { value: "tool-error" })], { stopReason: "toolUse" }),
+			fauxAssistantMessage([fauxToolCall("sure_update_state", { phase: { status: "success" } })], {
+				stopReason: "toolUse",
+			}),
+			fauxAssistantMessage([fauxToolCall("work", { value: "reject-this" })], { stopReason: "toolUse" }),
+			fauxAssistantMessage([fauxToolCall("work", { value: "tool-error-new" })], { stopReason: "toolUse" }),
+			fauxAssistantMessage([fauxToolCall("work", { value: "good" })], { stopReason: "toolUse" }),
+			() => fixture.finish(),
+		]);
+		await fixture.harness.session.prompt("/sure_feed model=demo");
+		expect(fixture.diagnoses).toBe(0);
+		expect(fixture.executed).toEqual(["tool-error", "tool-error-new", "good"]);
+		expect(JSON.parse(readFileSync(join(runDir(fixture.harness), "run.json"), "utf8")).status).toBe("success");
+	});
+	it.each(["repair", "continue"] as const)(
+		"retains %s guidance once across ordinary requests without compaction",
+		async (decision) => {
+			const fixture = await setup({ decision });
+			const tag = decision === "repair" ? "sure_supervisor_repair" : "sure_supervisor_continue";
+			const inspect = (context: { messages: unknown[] }) => {
+				const text = context.messages.map(getMessageText).join("\n");
+				expect(text.match(new RegExp(`<${tag} `, "g"))).toHaveLength(1);
+				expect(text).not.toContain("retained_repair");
+				expect(text).not.toContain("retained_continue");
+			};
+			fixture.harness.setResponses([
+				...Array.from({ length: 2 }, () =>
+					fauxAssistantMessage([fauxToolCall("work", { value: "bad" })], { stopReason: "toolUse" }),
+				),
+				(context) => {
+					inspect(context);
+					return fauxAssistantMessage(
+						[fauxToolCall("sure_update_state", { phase: { id: "stage", status: "running" } })],
+						{ stopReason: "toolUse" },
+					);
+				},
+				(context) => {
+					inspect(context);
+					return fauxAssistantMessage([fauxToolCall("work", { value: "good" })], { stopReason: "toolUse" });
+				},
+				() => fixture.finish(),
+			]);
+			await fixture.harness.session.prompt("/sure_feed model=demo");
+			expect(fixture.diagnoses).toBe(1);
+			expect(state(fixture.harness).repairs).toHaveLength(decision === "repair" ? 1 : 0);
+		},
+	);
 
 	it("returns a continue decision to the executor without creating a repair", async () => {
 		const fixture = await setup({ decision: "continue" });
@@ -507,7 +557,7 @@ describe("Sure executor/supervisor handoff", () => {
 				fauxAssistantMessage("Inspect the new failure before correcting it."),
 			]);
 			await fixture.harness.session.prompt("/sure_feed model=demo");
-			expect(fixture.diagnoses).toBe(1);
+			expect(fixture.diagnoses).toBe(rejection === "arguments" ? 0 : 1);
 			expect(fixture.executed).toEqual(rejection === "arguments" ? ["inspect", "tool-error-new"] : ["inspect"]);
 			expect(state(fixture.harness).lastFailure?.summary).toContain(
 				rejection === "arguments" ? "tool-error-new" : "Correct the rejected value",
@@ -1076,6 +1126,7 @@ describe("Sure executor/supervisor handoff", () => {
 				await fixture.harness.session.prompt("ONLY_REPAIR_CURRENT_ARTIFACT", { streamingBehavior: "steer" });
 				return fauxAssistantMessage([fauxToolCall("work", { value: "bad" })], { stopReason: "toolUse" });
 			},
+			fauxAssistantMessage([fauxToolCall("work", { value: "bad" })], { stopReason: "toolUse" }),
 		]);
 		await fixture.harness.session.prompt(
 			`/sure_feed model=demo output_dir=${join(fixture.harness.tempDir, "output")}`,
@@ -1190,7 +1241,8 @@ describe("Sure executor/supervisor handoff", () => {
 				if (action === "invalid") json(join(artifacts, "repo_summary.json"), { repo_url: 17 });
 				else if (action === "repair")
 					json(join(artifacts, "repo_summary.json"), { repo_url: "https://example.test/fixture" });
-				else if (action.startsWith("classify")) json(join(artifacts, "classification.json"), { task_type: action });
+				else if (action.startsWith("classify"))
+					json(join(artifacts, "classification.json"), { task_type: "unsupported", rationale: action });
 				const text =
 					action === "inspect-artifact"
 						? readFileSync(join(artifacts, "repo_summary.json"), "utf8")
@@ -1889,15 +1941,16 @@ describe("Sure executor/supervisor handoff", () => {
 		);
 	});
 
-	it("diagnoses ok:true plus a blocked phase even without an explicit error classification", async () => {
+	it("retains an unclassified blocked phase without inventing a repeated failure condition", async () => {
 		const fixture = await setup({ omitCheck: true, decision: "pause" });
 		fixture.harness.setResponses([
 			...Array.from({ length: 2 }, () =>
 				fauxAssistantMessage([fauxToolCall("work", { value: "bad" })], { stopReason: "toolUse" }),
 			),
+			fauxAssistantMessage("Inspect the unclassified blocker before another attempt."),
 		]);
 		await fixture.harness.session.prompt("/sure_feed model=demo");
-		expect(fixture.diagnoses).toBe(1);
+		expect(fixture.diagnoses).toBe(0);
 		expect(state(fixture.harness).lastCheck?.outcome).toBe("blocked");
 	});
 

@@ -471,9 +471,13 @@ function syncCoordinatedMessages(
 		!view.some(
 			(message) =>
 				(message.role === "user" || message.role === "custom") &&
-				(typeof message.content === "string" ? message.content : JSON.stringify(message.content)).includes(
-					`<sure_supervisor_repair id="${repair.id}"`,
-				),
+				(typeof message.content === "string"
+					? message.content
+					: message.content
+							.filter((block) => block.type === "text")
+							.map((block) => block.text)
+							.join("\n")
+				).includes(`<sure_supervisor_repair id="${repair.id}"`),
 		)
 	)
 		append(
@@ -493,9 +497,13 @@ function syncCoordinatedMessages(
 			!view.some(
 				(message) =>
 					(message.role === "user" || message.role === "custom") &&
-					(typeof message.content === "string" ? message.content : JSON.stringify(message.content)).includes(
-						`<sure_supervisor_continue id="${id}"`,
-					),
+					(typeof message.content === "string"
+						? message.content
+						: message.content
+								.filter((block) => block.type === "text")
+								.map((block) => block.text)
+								.join("\n")
+					).includes(`<sure_supervisor_continue id="${id}"`),
 			)
 		)
 			append(

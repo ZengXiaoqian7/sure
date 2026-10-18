@@ -2,7 +2,7 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "../tools/truncate.ts";
-import type { SureCheckEvidence, SureToolObservation } from "./coordination-types.ts";
+import { isSureBusinessCheck, type SureCheckEvidence, type SureToolObservation } from "./coordination-types.ts";
 import type { SureCoordinator } from "./coordinator.ts";
 import { readSureSnapshot, type SureSnapshot } from "./evidence.ts";
 import type { SureHookExecution } from "./hooks.ts";
@@ -287,7 +287,8 @@ export function loadSureDiagnosticIndex(coordinator: SureCoordinator) {
 		stage.checks++;
 		stage.lastCheck = version;
 		stage.outcomes[check.outcome] = (stage.outcomes[check.outcome] ?? 0) + 1;
-		if (check.outcome === "passed") stage.lastPassed = { checkVersion: version, artifactPaths: check.artifactPaths };
+		if (check.outcome === "passed" && isSureBusinessCheck(check))
+			stage.lastPassed = { checkVersion: version, artifactPaths: check.artifactPaths };
 		stages.set(check.unitId, stage);
 	}
 	const evidenceChecks = [

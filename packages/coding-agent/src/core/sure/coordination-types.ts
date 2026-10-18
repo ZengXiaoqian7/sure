@@ -65,6 +65,20 @@ export interface SureCheckEvidence {
 	progress?: { key: string; completed: number };
 }
 
+/** Invocation failures and preflight observations never establish a business gate result. */
+export function isSureBusinessCheck(check: SureCheckEvidence): boolean {
+	return (
+		check.failureKind !== "tool" &&
+		check.failureKind !== "execution" &&
+		check.failureKind !== "no_progress" &&
+		check.checker !== "pre_tool_call" &&
+		!check.checker?.startsWith("tool:") &&
+		!check.checker?.startsWith("control:") &&
+		!check.checker?.startsWith("rejection:") &&
+		!check.sourceId?.startsWith("pre_tool_call:")
+	);
+}
+
 export type SureCoordinationStatus = "executing" | "yielding" | "diagnosing" | "stopped";
 
 export interface SureDiagnosisResult {
